@@ -76,3 +76,10 @@ dmypy.json
 /server.py
 /client.py
 /test.json
+
+# Debian packaging artifacts
+*.deb
+*.buildinfo
+*.changes
+.pybuild/
+*.orig

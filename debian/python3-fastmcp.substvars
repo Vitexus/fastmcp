@@ -1,3 +1,0 @@
-python3:Depends=python3-authlib, python3-cyclopts, python3-dotenv, python3-exceptiongroup, python3-httpx, python3-jsonref, python3-jsonschema-path, python3-mcp, python3-openapi-pydantic, python3-opentelemetry-api, python3-packaging, python3-platformdirs (>= 4.0.0), python3-py-key-value-aio, python3-pydantic, python3-pyperclip, python3-rich, python3-uvicorn, python3-watchfiles, python3-websockets, python3:any
-misc:Depends=
-misc:Pre-Depends=

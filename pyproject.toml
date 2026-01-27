@@ -1,6 +1,6 @@
 [project]
 name = "fastmcp"
-version = "2.14.4"
+dynamic = ["version"]
 description = "The fast, Pythonic way to build MCP servers and clients."
 authors = [{ name = "Jeremiah Lowin" }]
 dependencies = [
@@ -45,13 +45,14 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Typing :: Typed",
 ]
 
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40.0"]
 openai = ["openai>=1.102.0"]
-tasks = ["pydocket>=0.17.2"]
+tasks = ["pydocket>=0.16.4"]
 
 [dependency-groups]
 dev = [
@@ -92,11 +93,20 @@ Repository = "https://github.com/jlowin/fastmcp"
 Documentation = "https://gofastmcp.com"
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "uv-dynamic-versioning>=0.7.0"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "uv-dynamic-versioning"
 
 [tool.hatch.metadata]
 allow-direct-references = true
+
+[tool.uv-dynamic-versioning]
+vcs = "git"
+style = "pep440"
+bump = true
+fallback-version = "0.0.0"
 
 
 [tool.pytest.ini_options]
