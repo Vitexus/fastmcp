@@ -1,9 +1,0 @@
-fastmcp (2.14.4-1) unstable; urgency=medium
-
-  * Initial Debian package release
-  * New upstream release v2.14.4
-  * FastMCP - Fast, Pythonic way to build MCP servers and clients
-  * Supports Python >= 3.10
-  * Includes CLI tool (fastmcp command)
-
- -- Vítězslav Dvořák <info@vitexsoftware.cz>  Sat, 25 Jan 2026 23:04:00 +0100
