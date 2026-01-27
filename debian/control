@@ -1,0 +1,56 @@
+Source: fastmcp
+Section: python
+Priority: optional
+Maintainer: Vítězslav Dvořák <info@vitexsoftware.cz>
+Build-Depends:
+ debhelper-compat (= 13),
+ dh-python,
+ pybuild-plugin-pyproject,
+ python3-all,
+ python3-hatchling,
+ python3-setuptools,
+ python3-pip,
+Standards-Version: 4.7.0
+Homepage: https://gofastmcp.com
+Vcs-Git: https://github.com/jlowin/fastmcp.git
+Vcs-Browser: https://github.com/jlowin/fastmcp
+Rules-Requires-Root: no
+
+Package: python3-fastmcp
+Architecture: all
+Depends:
+ ${misc:Depends},
+ ${python3:Depends},
+ python3-dotenv (>= 1.1.0),
+ python3-exceptiongroup (>= 1.2.2),
+ python3-httpx (>= 0.28.1),
+ python3-openapi-pydantic (>= 0.5.1),
+ python3-packaging (>= 24.0),
+ python3-platformdirs (>= 4.0.0),
+ python3-rich (>= 13.9.4),
+ python3-authlib (>= 1.6.5),
+ python3-pydantic (>= 2.11.7),
+ python3-pyperclip (>= 1.9.0),
+ python3-uvicorn (>= 0.35),
+ python3-websockets (>= 15.0.1),
+ python3-watchfiles (>= 1.0.0),
+ python3-mcp (>= 1.24.0),
+ python3-cyclopts (>= 4.0.0),
+ python3-py-key-value-aio (>= 0.3.0),
+ python3-jsonref (>= 1.1.0),
+ python3-jsonschema-path (>= 0.3.4),
+ python3-opentelemetry-api (>= 1.20.0),
+Description: Fast, Pythonic way to build MCP servers and clients
+ The Model Context Protocol (MCP) provides a standardized way to
+ connect AI agents to tools and data. FastMCP makes it easy to build
+ MCP applications with clean, Pythonic code.
+ .
+ FastMCP provides:
+  * Clean decorator-based API for defining tools, resources and prompts
+  * Automatic schema generation and validation
+  * Built-in support for various transport protocols
+  * Middleware for error handling, logging, and rate limiting
+  * OAuth and authentication support
+  * OpenAPI integration
+ .
+ This package provides the Python 3 library.

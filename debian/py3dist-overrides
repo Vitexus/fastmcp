@@ -1,0 +1,8 @@
+jsonref python3-jsonref
+mcp python3-mcp
+openapi_pydantic python3-openapi-pydantic
+opentelemetry_api python3-opentelemetry-api
+py_key_value_aio python3-py-key-value-aio
+cyclopts python3-cyclopts
+jsonschema_path python3-jsonschema-path
+typing_inspection python3-typing-inspection

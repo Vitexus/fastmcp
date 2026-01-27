@@ -1,0 +1,24 @@
+#!/usr/bin/make -f
+
+export PYBUILD_NAME=fastmcp
+
+%:
+	dh $@ --with python3 --buildsystem=pybuild
+
+override_dh_auto_configure:
+	# Backup original pyproject.toml
+	cp pyproject.toml pyproject.toml.orig
+	# Patch pyproject.toml to use static version instead of uv-dynamic-versioning
+	sed -i 's/dynamic = \["version"\]/version = "2.14.4"/' pyproject.toml
+	sed -i 's/requires = \["hatchling", "uv-dynamic-versioning>=0.7.0"\]/requires = ["hatchling"]/' pyproject.toml
+	sed -i '/\[tool.hatch.version\]/,/^$$/d' pyproject.toml
+	sed -i '/\[tool.uv-dynamic-versioning\]/,/^$$/d' pyproject.toml
+	dh_auto_configure
+
+override_dh_auto_test:
+	# Skip tests - test dependencies are not packaged in Debian
+
+override_dh_auto_clean:
+	dh_auto_clean
+	# Restore original pyproject.toml if backup exists
+	[ ! -f pyproject.toml.orig ] || mv pyproject.toml.orig pyproject.toml
