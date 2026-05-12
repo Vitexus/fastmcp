@@ -19,6 +19,9 @@ from rich.table import Table
 
 import fastmcp
 from fastmcp.cli import run as run_module
+from fastmcp.cli.auth import auth_app
+from fastmcp.cli.client import call_command, discover_command, list_command
+from fastmcp.cli.generate import generate_cli_command
 from fastmcp.cli.install import install_app
 from fastmcp.cli.tasks import tasks_app
 from fastmcp.utilities.cli import is_already_in_uv_subprocess, load_and_merge_config
@@ -36,7 +39,7 @@ console = Console()
 
 app = cyclopts.App(
     name="fastmcp",
-    help="FastMCP 2.0 - The fast, Pythonic way to build MCP servers and clients.",
+    help="FastMCP - The fast, Pythonic way to build MCP servers and clients.",
     version=fastmcp.__version__,
     # Disable automatic negative parameters by default
     default_parameter=Parameter(negative=()),
@@ -51,7 +54,7 @@ def _get_npx_command():
             try:
                 subprocess.run([cmd, "--version"], check=True, capture_output=True)
                 return cmd
-            except subprocess.CalledProcessError:
+            except (subprocess.CalledProcessError, FileNotFoundError):
                 continue
         return None
     return "npx"  # On Unix-like systems, just use npx
@@ -131,8 +134,12 @@ def version(
             console.print("[dim]Run: pip install --upgrade fastmcp[/dim]")
 
 
-@app.command
-async def dev(
+# Create dev subcommand group
+dev_app = cyclopts.App(name="dev", help="Development tools for MCP servers")
+
+
+@dev_app.command
+async def inspector(
     server_spec: str | None = None,
     *,
     with_editable: Annotated[
@@ -205,6 +212,13 @@ async def dev(
             help="Directories to watch for changes (default: current directory)",
         ),
     ] = None,
+    module: Annotated[
+        bool,
+        cyclopts.Parameter(
+            name=["--module", "-m"],
+            help="Run a Python module (python -m <module>) instead of importing a server object",
+        ),
+    ] = False,
 ) -> None:
     """Run an MCP server with the MCP Inspector for development.
 
@@ -247,7 +261,11 @@ async def dev(
             logger.error("No configuration available")
             sys.exit(1)
         assert config is not None  # For type checker
-        await config.source.load_server()
+
+        # Skip server-object validation in module mode — the module
+        # manages its own startup and may not expose an importable server.
+        if not module:
+            await config.source.load_server()
 
         env_vars = {}
         if ui_port:
@@ -270,6 +288,10 @@ async def dev(
 
         # Build the fastmcp run command
         fastmcp_cmd = ["fastmcp", "run", server_spec, "--no-banner"]
+
+        # Forward module mode flag
+        if module:
+            fastmcp_cmd.append("--module")
 
         # Add reload flags if enabled - the server will handle reloading
         if reload:
@@ -309,6 +331,54 @@ async def dev(
             extra={"file": str(server_spec)},
         )
         sys.exit(1)
+
+
+@dev_app.command
+async def apps(
+    server_spec: str,
+    *,
+    mcp_port: Annotated[
+        int,
+        cyclopts.Parameter(
+            "--mcp-port",
+            help="Port for the user's MCP server",
+        ),
+    ] = 8000,
+    dev_port: Annotated[
+        int,
+        cyclopts.Parameter(
+            "--dev-port",
+            help="Port for the FastMCP dev UI",
+        ),
+    ] = 8080,
+    reload: Annotated[
+        bool,
+        cyclopts.Parameter(
+            "--reload",
+            negative="--no-reload",
+            help="Auto-reload the MCP server on file changes",
+        ),
+    ] = True,
+) -> None:
+    """Preview a FastMCPApp UI in the browser.
+
+    Starts the MCP server from SERVER_SPEC on --mcp-port, launches a local
+    dev UI on --dev-port with a tool picker and AppBridge host, then opens
+    the browser automatically.
+
+    Requires fastmcp[apps] to be installed (prefab-ui).
+    """
+    try:
+        import prefab_ui  # noqa: F401
+    except ImportError:
+        logger.error(
+            "fastmcp dev apps requires prefab-ui. Install with: pip install 'fastmcp[apps]'"
+        )
+        sys.exit(1)
+
+    from fastmcp.cli.apps_dev import run_dev_apps
+
+    await run_dev_apps(server_spec, mcp_port=mcp_port, dev_port=dev_port, reload=reload)
 
 
 @app.command
@@ -417,6 +487,13 @@ async def run(
             help="Run in stateless mode (no session, used internally for reload)",
         ),
     ] = False,
+    module: Annotated[
+        bool,
+        cyclopts.Parameter(
+            name=["--module", "-m"],
+            help="Run a Python module (python -m <module>) instead of importing a server object",
+        ),
+    ] = False,
 ) -> None:
     """Run an MCP server or connect to a remote one.
 
@@ -427,6 +504,7 @@ async def run(
     4. MCPConfig file: "mcp.json" - runs as a proxy server for the MCP Servers in the MCPConfig file
     5. FastMCP config: "fastmcp.json" - runs server using FastMCP configuration
     6. No argument: looks for fastmcp.json in current directory
+    7. Module mode: "-m my_module" - runs the module directly via python -m
 
     Server arguments can be passed after -- :
     fastmcp run server.py -- --config config.json --debug
@@ -434,6 +512,71 @@ async def run(
     Args:
         server_spec: Python file, object specification (file:obj), config file, URL, or None to auto-detect
     """
+
+    # --- Module mode: delegate to python -m and exit early ---
+    if module:
+        if server_spec is None:
+            logger.error("A module name is required when using --module / -m")
+            sys.exit(1)
+
+        # Warn about options that are ignored in module mode
+        ignored_options: list[str] = []
+        if transport is not None:
+            ignored_options.append("--transport")
+        if host is not None:
+            ignored_options.append("--host")
+        if port is not None:
+            ignored_options.append("--port")
+        if path is not None:
+            ignored_options.append("--path")
+        if ignored_options:
+            logger.warning(
+                f"Options {', '.join(ignored_options)} are ignored in module mode "
+                f"(-m). The module manages its own server startup."
+            )
+
+        # Build environment wrapper if needed
+        env_builder = None
+        if not skip_env and not is_already_in_uv_subprocess():
+            from fastmcp.utilities.mcp_server_config.v1.environments.uv import (
+                UVEnvironment,
+            )
+
+            env = UVEnvironment(
+                python=python,
+                dependencies=with_packages or None,
+                requirements=with_requirements,
+                project=project,
+            )
+            test_cmd = ["test"]
+            if env.build_command(test_cmd) != test_cmd:
+                env_builder = env.build_command
+
+        if reload:
+            # Build a fastmcp run command for the reload watcher to restart
+            reload_cmd = ["fastmcp", "run", server_spec, "--module", "--no-reload"]
+            if log_level:
+                reload_cmd.extend(["--log-level", log_level])
+            if no_banner:
+                reload_cmd.append("--no-banner")
+            if env_builder is not None:
+                reload_cmd.append("--skip-env")
+            if server_args:
+                reload_cmd.append("--")
+                reload_cmd.extend(server_args)
+            if env_builder is not None:
+                reload_cmd = env_builder(reload_cmd)
+            await run_module.run_with_reload(
+                reload_cmd, reload_dirs=reload_dir, is_stdio=True
+            )
+            return
+
+        run_module.run_module_command(
+            server_spec,
+            env_command_builder=env_builder,
+            extra_args=list(server_args) if server_args else None,
+        )
+        return
 
     # Check if we were spawned by uv (or user explicitly set --skip-env)
     if skip_env or is_already_in_uv_subprocess():
@@ -458,11 +601,15 @@ async def run(
         sys.exit(1)
 
     # Get effective values (CLI overrides take precedence)
-    final_transport = transport or config.deployment.transport
-    final_host = host or config.deployment.host
-    final_port = port or config.deployment.port
-    final_path = path or config.deployment.path
-    final_log_level = log_level or config.deployment.log_level
+    final_transport = (
+        transport if transport is not None else config.deployment.transport
+    )
+    final_host = host if host is not None else config.deployment.host
+    final_port = port if port is not None else config.deployment.port
+    final_path = path if path is not None else config.deployment.path
+    final_log_level = (
+        log_level if log_level is not None else config.deployment.log_level
+    )
     final_server_args = server_args or config.deployment.args
     # Use CLI override if provided, otherwise use settings
     # no_banner CLI flag overrides the show_server_banner setting
@@ -499,11 +646,11 @@ async def run(
             if final_transport:
                 reload_cmd.extend(["--transport", final_transport])
             if final_transport != "stdio":
-                if final_host:
+                if final_host is not None:
                     reload_cmd.extend(["--host", final_host])
-                if final_port:
+                if final_port is not None:
                     reload_cmd.extend(["--port", str(final_port)])
-                if final_path:
+                if final_path is not None:
                     reload_cmd.extend(["--path", final_path])
             if final_log_level:
                 reload_cmd.extend(["--log-level", final_log_level])
@@ -548,11 +695,11 @@ async def run(
             inner_cmd.extend(["--transport", final_transport])
         # Only add HTTP-specific options for non-stdio transports
         if final_transport != "stdio":
-            if final_host:
+            if final_host is not None:
                 inner_cmd.extend(["--host", final_host])
-            if final_port:
+            if final_port is not None:
                 inner_cmd.extend(["--port", str(final_port)])
-            if final_path:
+            if final_path is not None:
                 inner_cmd.extend(["--path", final_path])
         if final_log_level:
             inner_cmd.extend(["--log-level", final_log_level])
@@ -943,6 +1090,9 @@ async def prepare(
         sys.exit(1)
 
 
+# Add dev subcommand group
+app.command(dev_app)
+
 # Add project subcommand group
 app.command(project_app)
 
@@ -951,6 +1101,15 @@ app.command(install_app)
 
 # Add tasks subcommand group
 app.command(tasks_app)
+
+# Add client query commands
+app.command(list_command, name="list")
+app.command(call_command, name="call")
+app.command(discover_command, name="discover")
+app.command(generate_cli_command, name="generate-cli")
+
+# Add auth subcommand group (includes CIMD commands)
+app.command(auth_app)
 
 
 if __name__ == "__main__":

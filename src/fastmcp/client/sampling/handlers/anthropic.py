@@ -3,10 +3,11 @@
 from collections.abc import Iterator, Sequence
 from typing import Any
 
-from mcp.types import CreateMessageRequestParams as SamplingParams
 from mcp.types import (
+    AudioContent,
     CreateMessageResult,
     CreateMessageResultWithTools,
+    ImageContent,
     ModelPreferences,
     SamplingMessage,
     SamplingMessageContentBlock,
@@ -17,11 +18,13 @@ from mcp.types import (
     ToolResultContent,
     ToolUseContent,
 )
+from mcp.types import CreateMessageRequestParams as SamplingParams
 
 try:
-    from anthropic import AsyncAnthropic, NotGiven
-    from anthropic._types import NOT_GIVEN
+    from anthropic import AsyncAnthropic
     from anthropic.types import (
+        Base64ImageSourceParam,
+        ImageBlockParam,
         Message,
         MessageParam,
         TextBlock,
@@ -42,6 +45,28 @@ except ImportError as e:
     ) from e
 
 __all__ = ["AnthropicSamplingHandler"]
+
+# Anthropic supports these image MIME types
+_ANTHROPIC_IMAGE_MEDIA_TYPES = frozenset(
+    {"image/jpeg", "image/png", "image/gif", "image/webp"}
+)
+
+
+def _image_content_to_anthropic_block(content: ImageContent) -> ImageBlockParam:
+    """Convert MCP ImageContent to Anthropic ImageBlockParam."""
+    if content.mimeType not in _ANTHROPIC_IMAGE_MEDIA_TYPES:
+        raise ValueError(
+            f"Unsupported image MIME type for Anthropic: {content.mimeType!r}. "
+            f"Supported types: {', '.join(sorted(_ANTHROPIC_IMAGE_MEDIA_TYPES))}"
+        )
+    return ImageBlockParam(
+        type="image",
+        source=Base64ImageSourceParam(
+            type="base64",
+            media_type=content.mimeType,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+            data=content.data,
+        ),
+    )
 
 
 class AnthropicSamplingHandler:
@@ -81,37 +106,40 @@ class AnthropicSamplingHandler:
         model: ModelParam = self._select_model_from_preferences(params.modelPreferences)
 
         # Convert MCP tools to Anthropic format
-        anthropic_tools: list[ToolParam] | NotGiven = NOT_GIVEN
+        anthropic_tools: list[ToolParam] | None = None
         if params.tools:
             anthropic_tools = self._convert_tools_to_anthropic(params.tools)
 
         # Convert tool_choice to Anthropic format
         # Returns None if mode is "none", signaling tools should be omitted
-        anthropic_tool_choice: ToolChoiceParam | NotGiven = NOT_GIVEN
+        anthropic_tool_choice: ToolChoiceParam | None = None
         if params.toolChoice:
             converted = self._convert_tool_choice_to_anthropic(params.toolChoice)
             if converted is None:
                 # tool_choice="none" means don't use tools
-                anthropic_tools = NOT_GIVEN
+                anthropic_tools = None
             else:
                 anthropic_tool_choice = converted
 
-        response = await self.client.messages.create(
-            model=model,
-            messages=anthropic_messages,
-            system=(
-                params.systemPrompt if params.systemPrompt is not None else NOT_GIVEN
-            ),
-            temperature=(
-                params.temperature if params.temperature is not None else NOT_GIVEN
-            ),
-            max_tokens=params.maxTokens,
-            stop_sequences=(
-                params.stopSequences if params.stopSequences is not None else NOT_GIVEN
-            ),
-            tools=anthropic_tools,
-            tool_choice=anthropic_tool_choice,
-        )
+        # Build kwargs to avoid sentinel type compatibility issues across
+        # anthropic SDK versions (NotGiven vs Omit)
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": anthropic_messages,
+            "max_tokens": params.maxTokens,
+        }
+        if params.systemPrompt is not None:
+            kwargs["system"] = params.systemPrompt
+        if params.temperature is not None:
+            kwargs["temperature"] = params.temperature
+        if params.stopSequences is not None:
+            kwargs["stop_sequences"] = params.stopSequences
+        if anthropic_tools is not None:
+            kwargs["tools"] = anthropic_tools
+        if anthropic_tool_choice is not None:
+            kwargs["tool_choice"] = anthropic_tool_choice
+
+        response = await self.client.messages.create(**kwargs)
 
         # Return appropriate result type based on whether tools were provided
         if params.tools:
@@ -153,7 +181,10 @@ class AnthropicSamplingHandler:
             # Handle list content (from CreateMessageResultWithTools)
             if isinstance(content, list):
                 content_blocks: list[
-                    TextBlockParam | ToolUseBlockParam | ToolResultBlockParam
+                    TextBlockParam
+                    | ImageBlockParam
+                    | ToolUseBlockParam
+                    | ToolResultBlockParam
                 ] = []
 
                 for item in content:
@@ -170,16 +201,26 @@ class AnthropicSamplingHandler:
                         content_blocks.append(
                             TextBlockParam(type="text", text=item.text)
                         )
+                    elif isinstance(item, ImageContent):
+                        if message.role != "user":
+                            raise ValueError(
+                                "ImageContent is only supported in user messages "
+                                "for Anthropic"
+                            )
+                        content_blocks.append(_image_content_to_anthropic_block(item))
+                    elif isinstance(item, AudioContent):
+                        raise ValueError(
+                            "AudioContent is not supported by the Anthropic API"
+                        )
                     elif isinstance(item, ToolResultContent):
                         # Extract text content from the result
                         result_content: str | list[TextBlockParam] = ""
                         if item.content:
-                            text_blocks: list[TextBlockParam] = []
-                            for sub_item in item.content:
-                                if isinstance(sub_item, TextContent):
-                                    text_blocks.append(
-                                        TextBlockParam(type="text", text=sub_item.text)
-                                    )
+                            text_blocks: list[TextBlockParam] = [
+                                TextBlockParam(type="text", text=sub_item.text)
+                                for sub_item in item.content
+                                if isinstance(sub_item, TextContent)
+                            ]
                             if len(text_blocks) == 1:
                                 result_content = text_blocks[0]["text"]
                             elif text_blocks:
@@ -192,6 +233,10 @@ class AnthropicSamplingHandler:
                                 content=result_content,
                                 is_error=item.isError if item.isError else False,
                             )
+                        )
+                    else:
+                        raise ValueError(
+                            f"Unsupported content type for Anthropic: {type(item).__name__}"
                         )
 
                 if content_blocks:
@@ -224,12 +269,11 @@ class AnthropicSamplingHandler:
             if isinstance(content, ToolResultContent):
                 result_content_str: str | list[TextBlockParam] = ""
                 if content.content:
-                    text_parts: list[TextBlockParam] = []
-                    for item in content.content:
-                        if isinstance(item, TextContent):
-                            text_parts.append(
-                                TextBlockParam(type="text", text=item.text)
-                            )
+                    text_parts: list[TextBlockParam] = [
+                        TextBlockParam(type="text", text=item.text)
+                        for item in content.content
+                        if isinstance(item, TextContent)
+                    ]
                     if len(text_parts) == 1:
                         result_content_str = text_parts[0]["text"]
                     elif text_parts:
@@ -259,6 +303,24 @@ class AnthropicSamplingHandler:
                     )
                 )
                 continue
+
+            # Handle ImageContent
+            if isinstance(content, ImageContent):
+                if message.role != "user":
+                    raise ValueError(
+                        "ImageContent is only supported in user messages for Anthropic"
+                    )
+                anthropic_messages.append(
+                    MessageParam(
+                        role="user",
+                        content=[_image_content_to_anthropic_block(content)],
+                    )
+                )
+                continue
+
+            # Handle AudioContent - not supported by Anthropic
+            if isinstance(content, AudioContent):
+                raise ValueError("AudioContent is not supported by the Anthropic API")
 
             raise ValueError(f"Unsupported content type: {type(content)}")
 

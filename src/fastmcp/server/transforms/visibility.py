@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
 import mcp.types
 
-from fastmcp.resources.resource import Resource
+from fastmcp.resources.base import Resource
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.transforms import (
     GetPromptNext,
@@ -24,9 +24,9 @@ from fastmcp.server.transforms import (
 from fastmcp.utilities.versions import VersionSpec
 
 if TYPE_CHECKING:
-    from fastmcp.prompts.prompt import Prompt
+    from fastmcp.prompts.base import Prompt
     from fastmcp.server.context import Context
-    from fastmcp.tools.tool import Tool
+    from fastmcp.tools.base import Tool
     from fastmcp.utilities.components import FastMCPComponent
 
 T = TypeVar("T", bound="FastMCPComponent")
@@ -171,23 +171,23 @@ class Visibility(Transform):
         return self.tags is None or bool(component.tags & self.tags)
 
     def _mark_component(self, component: T) -> T:
-        """Set visibility state in component metadata if rule matches."""
+        """Set visibility state in component metadata if rule matches.
+
+        Returns a copy of the component with updated metadata to avoid
+        mutating shared objects cached in providers.
+        """
         if not self._matches(component):
             return component
 
-        # Create new dicts to avoid mutating shared dicts
-        # (e.g., when Tool.from_tool shares the meta dict between tools)
         if component.meta is None:
-            component.meta = {
-                _FASTMCP_KEY: {_INTERNAL_KEY: {"visibility": self._enabled}}
-            }
+            new_meta = {_FASTMCP_KEY: {_INTERNAL_KEY: {"visibility": self._enabled}}}
         else:
             old_fastmcp = component.meta.get(_FASTMCP_KEY, {})
             old_internal = old_fastmcp.get(_INTERNAL_KEY, {})
             new_internal = {**old_internal, "visibility": self._enabled}
             new_fastmcp = {**old_fastmcp, _INTERNAL_KEY: new_internal}
-            component.meta = {**component.meta, _FASTMCP_KEY: new_fastmcp}
-        return component
+            new_meta = {**component.meta, _FASTMCP_KEY: new_fastmcp}
+        return component.model_copy(update={"meta": new_meta})
 
     # -------------------------------------------------------------------------
     # Transform methods (mark components, don't filter)

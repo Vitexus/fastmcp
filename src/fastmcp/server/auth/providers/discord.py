@@ -21,8 +21,10 @@ Example:
 
 from __future__ import annotations
 
+import contextlib
 import time
 from datetime import datetime
+from typing import Literal
 
 import httpx
 from key_value.aio.protocols import AsyncKeyValue
@@ -47,22 +49,34 @@ class DiscordTokenVerifier(TokenVerifier):
     def __init__(
         self,
         *,
+        expected_client_id: str,
         required_scopes: list[str] | None = None,
         timeout_seconds: int = 10,
+        http_client: httpx.AsyncClient | None = None,
     ):
         """Initialize the Discord token verifier.
 
         Args:
+            expected_client_id: Expected Discord OAuth client ID for audience binding
             required_scopes: Required OAuth scopes (e.g., ['email'])
             timeout_seconds: HTTP request timeout
+            http_client: Optional httpx.AsyncClient for connection pooling. When provided,
+                the client is reused across calls and the caller is responsible for its
+                lifecycle. When None (default), a fresh client is created per call.
         """
         super().__init__(required_scopes=required_scopes)
+        self.expected_client_id = expected_client_id
         self.timeout_seconds = timeout_seconds
+        self._http_client = http_client
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Verify Discord OAuth token by calling Discord's tokeninfo API."""
         try:
-            async with httpx.AsyncClient(timeout=self.timeout_seconds) as client:
+            async with (
+                contextlib.nullcontext(self._http_client)
+                if self._http_client is not None
+                else httpx.AsyncClient(timeout=self.timeout_seconds)
+            ) as client:
                 # Use Discord's tokeninfo endpoint to validate the token
                 headers = {
                     "Authorization": f"Bearer {token}",
@@ -111,6 +125,13 @@ class DiscordTokenVerifier(TokenVerifier):
                 user_data = token_info.get("user", {})
                 application = token_info.get("application") or {}
                 client_id = str(application.get("id", "unknown"))
+                if client_id != self.expected_client_id:
+                    logger.debug(
+                        "Discord token app ID mismatch: expected %s, got %s",
+                        self.expected_client_id,
+                        client_id,
+                    )
+                    return None
 
                 # Create AccessToken with Discord user info
                 access_token = AccessToken(
@@ -175,6 +196,7 @@ class DiscordProvider(OAuthProxy):
         client_id: str,
         client_secret: str,
         base_url: AnyHttpUrl | str,
+        resource_base_url: AnyHttpUrl | str | None = None,
         issuer_url: AnyHttpUrl | str | None = None,
         redirect_path: str | None = None,
         required_scopes: list[str] | None = None,
@@ -182,7 +204,11 @@ class DiscordProvider(OAuthProxy):
         allowed_client_redirect_uris: list[str] | None = None,
         client_storage: AsyncKeyValue | None = None,
         jwt_signing_key: str | bytes | None = None,
-        require_authorization_consent: bool = True,
+        require_authorization_consent: bool | Literal["external"] = True,
+        consent_csp_policy: str | None = None,
+        forward_resource: bool = True,
+        http_client: httpx.AsyncClient | None = None,
+        enable_cimd: bool = True,
     ):
         """Initialize Discord OAuth provider.
 
@@ -190,6 +216,8 @@ class DiscordProvider(OAuthProxy):
             client_id: Discord OAuth client ID (e.g., "123456789")
             client_secret: Discord OAuth client secret (e.g., "S....")
             base_url: Public URL where OAuth endpoints will be accessible (includes any mount path)
+            resource_base_url: Optional public base URL for the protected resource metadata
+                and token audience. Defaults to ``base_url``.
             issuer_url: Issuer URL for OAuth metadata (defaults to base_url). Use root-level URL
                 to avoid 404s during discovery when mounting under a path.
             redirect_path: Redirect path configured in Discord OAuth app (defaults to "/auth/callback")
@@ -201,15 +229,22 @@ class DiscordProvider(OAuthProxy):
             allowed_client_redirect_uris: List of allowed redirect URI patterns for MCP clients.
                 If None (default), all URIs are allowed. If empty list, no URIs are allowed.
             client_storage: Storage backend for OAuth state (client registrations, encrypted tokens).
-                If None, a DiskStore will be created in the data directory (derived from `platformdirs`). The
-                disk store will be encrypted using a key derived from the JWT Signing Key.
+                If None, an encrypted file store will be created in the data directory
+                (derived from `platformdirs`).
             jwt_signing_key: Secret for signing FastMCP JWT tokens (any string or bytes). If bytes are provided,
                 they will be used as is. If a string is provided, it will be derived into a 32-byte key. If not
                 provided, the upstream client secret will be used to derive a 32-byte key using PBKDF2.
             require_authorization_consent: Whether to require user consent before authorizing clients (default True).
                 When True, users see a consent screen before being redirected to Discord.
                 When False, authorization proceeds directly without user confirmation.
-                SECURITY WARNING: Only disable for local development or testing environments.
+                When "external", the built-in consent screen is skipped but no warning is
+                logged, indicating that consent is handled externally (e.g. by the upstream IdP).
+                SECURITY WARNING: Only set to False for local development or testing environments.
+            http_client: Optional httpx.AsyncClient for connection pooling in token verification.
+                When provided, the client is reused across verify_token calls and the caller
+                is responsible for its lifecycle. When None (default), a fresh client is created per call.
+            enable_cimd: Enable CIMD (Client ID Metadata Document) support for URL-based
+                client IDs (default True). Set to False to disable.
         """
         # Parse scopes if provided as string
         required_scopes_final = (
@@ -220,8 +255,10 @@ class DiscordProvider(OAuthProxy):
 
         # Create Discord token verifier
         token_verifier = DiscordTokenVerifier(
+            expected_client_id=client_id,
             required_scopes=required_scopes_final,
             timeout_seconds=timeout_seconds,
+            http_client=http_client,
         )
 
         # Initialize OAuth proxy with Discord endpoints
@@ -232,12 +269,16 @@ class DiscordProvider(OAuthProxy):
             upstream_client_secret=client_secret,
             token_verifier=token_verifier,
             base_url=base_url,
+            resource_base_url=resource_base_url,
             redirect_path=redirect_path,
             issuer_url=issuer_url or base_url,  # Default to base_url if not specified
             allowed_client_redirect_uris=allowed_client_redirect_uris,
             client_storage=client_storage,
             jwt_signing_key=jwt_signing_key,
             require_authorization_consent=require_authorization_consent,
+            consent_csp_policy=consent_csp_policy,
+            forward_resource=forward_resource,
+            enable_cimd=enable_cimd,
         )
 
         logger.debug(

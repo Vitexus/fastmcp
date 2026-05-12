@@ -6,11 +6,11 @@ import json
 import mimetypes
 from collections.abc import Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import AnyUrl
 
-from fastmcp.resources.resource import Resource, ResourceResult
+from fastmcp.resources.base import Resource, ResourceResult
 from fastmcp.resources.template import ResourceTemplate
 from fastmcp.server.providers.base import Provider
 from fastmcp.server.providers.skills._common import (
@@ -37,6 +37,15 @@ class SkillResource(Resource):
 
     skill_info: SkillInfo
     is_manifest: bool = False
+
+    def get_meta(self) -> dict[str, Any]:
+        meta = super().get_meta()
+        fastmcp = cast(dict[str, Any], meta["fastmcp"])
+        fastmcp["skill"] = {
+            "name": self.skill_info.name,
+            "is_manifest": self.is_manifest,
+        }
+        return meta
 
     async def read(self) -> str | bytes | ResourceResult:
         """Read the resource content."""
@@ -94,7 +103,7 @@ class SkillFileTemplate(ResourceTemplate):
         uri: str,
         params: dict[str, Any],
         task_meta: Any = None,
-    ) -> ResourceResult:
+    ) -> ResourceResult:  # ty:ignore[invalid-method-override]
         """Server entry point - read file directly without creating ephemeral resource.
 
         Note: task_meta is ignored - this template doesn't support background tasks.
@@ -134,6 +143,14 @@ class SkillFileResource(Resource):
 
     skill_info: SkillInfo
     file_path: str
+
+    def get_meta(self) -> dict[str, Any]:
+        meta = super().get_meta()
+        fastmcp = cast(dict[str, Any], meta["fastmcp"])
+        fastmcp["skill"] = {
+            "name": self.skill_info.name,
+        }
+        return meta
 
     async def read(self) -> str | bytes | ResourceResult:
         """Read the file content."""

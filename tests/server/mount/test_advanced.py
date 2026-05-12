@@ -2,6 +2,7 @@
 
 import pytest
 from mcp.types import TextContent
+from starlette.routing import Route
 
 from fastmcp import FastMCP
 from fastmcp.client import Client
@@ -53,8 +54,8 @@ class TestDynamicChanges:
         tools = await main_app.list_tools()
         assert any(t.name == "sub_temp_tool" for t in tools)
 
-        # Remove the tool from sub_app using public API
-        sub_app.remove_tool("temp_tool")
+        # Remove the tool from sub_app
+        sub_app.local_provider.remove_tool("temp_tool")
 
         # The tool should no longer be accessible
         tools = await main_app.list_tools()
@@ -82,7 +83,7 @@ class TestCustomRouteForwarding:
 
         routes = server._get_additional_http_routes()
         assert len(routes) == 1
-        assert hasattr(routes[0], "path")
+        assert isinstance(routes[0], Route)
         assert routes[0].path == "/test"
 
     async def test_mounted_servers_tracking(self):
@@ -145,15 +146,107 @@ class TestCustomRouteForwarding:
 
         routes = server._get_additional_http_routes()
         assert len(routes) == 2
-        route_paths = [route.path for route in routes if hasattr(route, "path")]
+        route_paths = [route.path for route in routes if isinstance(route, Route)]
         assert "/route1" in route_paths
         assert "/route2" in route_paths
+
+    async def test_mounted_server_custom_routes_forwarded(self):
+        """Test that custom routes from a mounted server appear in the parent.
+
+        Regression test for https://github.com/PrefectHQ/fastmcp/issues/3457
+        where custom_route endpoints defined on a child server were silently
+        dropped when the child was mounted onto a parent, resulting in 404s.
+        """
+        parent = FastMCP("Parent")
+        child = FastMCP("Child")
+
+        @child.custom_route("/readyz", methods=["GET"])
+        async def readiness_check(request):
+            from starlette.responses import JSONResponse
+
+            return JSONResponse({"status": "ok"})
+
+        parent.mount(child)
+
+        routes = parent._get_additional_http_routes()
+        assert len(routes) == 1
+        assert isinstance(routes[0], Route)
+        assert routes[0].path == "/readyz"
+
+    async def test_mounted_server_custom_routes_with_namespace(self):
+        """Test that custom routes from a namespaced mount are forwarded."""
+        parent = FastMCP("Parent")
+        child = FastMCP("Child")
+
+        @child.custom_route("/health", methods=["GET"])
+        async def health(request):
+            from starlette.responses import JSONResponse
+
+            return JSONResponse({"status": "ok"})
+
+        parent.mount(child, namespace="child")
+
+        routes = parent._get_additional_http_routes()
+        assert len(routes) == 1
+        assert isinstance(routes[0], Route)
+        assert routes[0].path == "/health"
+
+    async def test_deeply_nested_custom_routes_forwarded(self):
+        """Test that custom routes from deeply nested mounts are collected."""
+        root = FastMCP("Root")
+        middle = FastMCP("Middle")
+        leaf = FastMCP("Leaf")
+
+        @leaf.custom_route("/leaf-health", methods=["GET"])
+        async def leaf_health(request):
+            from starlette.responses import JSONResponse
+
+            return JSONResponse({"status": "ok"})
+
+        @middle.custom_route("/middle-health", methods=["GET"])
+        async def middle_health(request):
+            from starlette.responses import JSONResponse
+
+            return JSONResponse({"status": "ok"})
+
+        middle.mount(leaf)
+        root.mount(middle)
+
+        routes = root._get_additional_http_routes()
+        route_paths = [r.path for r in routes if isinstance(r, Route)]
+        assert "/leaf-health" in route_paths
+        assert "/middle-health" in route_paths
+        assert len(route_paths) == 2
+
+    async def test_mounted_custom_routes_http_app_integration(self):
+        """End-to-end: custom routes from mounted servers are reachable via http_app.
+
+        This reproduces the exact scenario from issue #3457.
+        """
+        from starlette.testclient import TestClient
+
+        parent = FastMCP("Parent")
+        child = FastMCP("Child")
+
+        @child.custom_route("/readyz", methods=["GET"])
+        async def readiness_check(request):
+            from starlette.responses import JSONResponse
+
+            return JSONResponse({"status": "ok"})
+
+        parent.mount(child)
+
+        app = parent.http_app()
+        client = TestClient(app)
+        response = client.get("/readyz")
+        assert response.status_code == 200
+        assert response.json() == {"status": "ok"}
 
 
 class TestDeeplyNestedMount:
     """Test deeply nested mount scenarios (3+ levels deep).
 
-    This tests the fix for https://github.com/jlowin/fastmcp/issues/2583
+    This tests the fix for https://github.com/PrefectHQ/fastmcp/issues/2583
     where tools/resources/prompts mounted more than 2 levels deep would fail
     to invoke even though they were correctly listed.
     """

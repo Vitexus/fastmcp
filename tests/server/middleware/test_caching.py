@@ -2,12 +2,18 @@
 
 import sys
 import tempfile
+import warnings
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import mcp.types
 import pytest
 from inline_snapshot import snapshot
-from key_value.aio.stores.disk import DiskStore
+from key_value.aio.stores.filetree import (
+    FileTreeStore,
+    FileTreeV1CollectionSanitizationStrategy,
+    FileTreeV1KeySanitizationStrategy,
+)
 from key_value.aio.stores.memory import MemoryStore
 from key_value.aio.wrappers.statistics.wrapper import (
     GetStatistics,
@@ -21,17 +27,20 @@ from pydantic import AnyUrl, BaseModel
 from fastmcp import Context, FastMCP
 from fastmcp.client.client import CallToolResult, Client
 from fastmcp.client.transports import FastMCPTransport
+from fastmcp.prompts.base import Message, Prompt
 from fastmcp.prompts.function_prompt import FunctionPrompt
-from fastmcp.prompts.prompt import Message, Prompt
-from fastmcp.resources.resource import Resource
+from fastmcp.resources.base import Resource
 from fastmcp.server.middleware.caching import (
     CachableToolResult,
     CallToolSettings,
     ResponseCachingMiddleware,
     ResponseCachingStatistics,
+    _make_call_tool_cache_key,
+    _make_get_prompt_cache_key,
+    _make_read_resource_cache_key,
 )
 from fastmcp.server.middleware.middleware import CallNext, MiddlewareContext
-from fastmcp.tools.tool import Tool, ToolResult
+from fastmcp.tools.base import Tool, ToolResult
 
 TEST_URI = AnyUrl("https://test_uri")
 
@@ -281,19 +290,31 @@ class TestResponseCachingMiddleware:
 class TestResponseCachingMiddlewareIntegration:
     """Integration tests with real FastMCP server."""
 
-    @pytest.fixture(params=["memory", "disk"])
+    @pytest.fixture(params=["memory", "filetree"])
     async def caching_server(
         self,
         tracking_calculator: TrackingCalculator,
         request: pytest.FixtureRequest,
     ):
         """Create a FastMCP server for caching tests."""
-        mcp = FastMCP("CachingTestServer")
+        mcp = FastMCP("CachingTestServer", dereference_schemas=False)
 
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
-            disk_store: DiskStore = DiskStore(directory=temp_dir)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", UserWarning)
+                file_store = FileTreeStore(
+                    data_directory=Path(temp_dir),
+                    key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(
+                        Path(temp_dir)
+                    ),
+                    collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(
+                        Path(temp_dir)
+                    ),
+                )
             response_caching_middleware = ResponseCachingMiddleware(
-                cache_storage=disk_store if request.param == "disk" else MemoryStore(),
+                cache_storage=file_store
+                if request.param == "filetree"
+                else MemoryStore(),
             )
 
             mcp.add_middleware(middleware=response_caching_middleware)
@@ -303,8 +324,6 @@ class TestResponseCachingMiddlewareIntegration:
             tracking_calculator.add_prompts(fastmcp=mcp)
 
             yield mcp
-
-            await disk_store.close()
 
     @pytest.fixture
     def non_caching_server(self, tracking_calculator: TrackingCalculator):
@@ -615,3 +634,40 @@ class TestCachingWithImportedServerPrefixes:
             result = await client.call_tool("child_add", {"a": 5, "b": 3})
             assert not result.is_error
             assert tracking_calculator.add_calls == 1
+
+
+class TestCacheKeyGeneration:
+    def test_call_tool_key_is_hashed_and_does_not_include_raw_input(self):
+        msg = mcp.types.CallToolRequestParams(
+            name="toolX",
+            arguments={"password": "secret", "path": "../../etc/passwd"},
+        )
+
+        key = _make_call_tool_cache_key(msg)
+
+        assert len(key) == 64
+        assert "secret" not in key
+        assert "../../etc/passwd" not in key
+
+    def test_read_resource_key_is_hashed_and_does_not_include_raw_uri(self):
+        msg = mcp.types.ReadResourceRequestParams(
+            uri=AnyUrl("file:///tmp/../../etc/shadow?token=abcd")
+        )
+
+        key = _make_read_resource_cache_key(msg)
+
+        assert len(key) == 64
+        assert "shadow" not in key
+        assert "token=abcd" not in key
+
+    def test_get_prompt_key_is_hashed_and_stable(self):
+        msg = mcp.types.GetPromptRequestParams(
+            name="promptY",
+            arguments={"api_key": "ABC123", "scope": "admin"},
+        )
+
+        key = _make_get_prompt_cache_key(msg)
+
+        assert len(key) == 64
+        assert "ABC123" not in key
+        assert key == _make_get_prompt_cache_key(msg)

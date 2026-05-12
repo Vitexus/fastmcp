@@ -10,7 +10,6 @@ executed.
 
 from __future__ import annotations
 
-import re
 from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any, overload
@@ -18,13 +17,13 @@ from typing import TYPE_CHECKING, Any, overload
 import mcp.types
 from mcp.types import AnyUrl
 
-from fastmcp.prompts.prompt import Prompt, PromptResult
-from fastmcp.resources.resource import Resource, ResourceResult
-from fastmcp.resources.template import ResourceTemplate
+from fastmcp.prompts.base import Prompt, PromptResult
+from fastmcp.resources.base import Resource, ResourceResult
+from fastmcp.resources.template import ResourceTemplate, expand_uri_template
 from fastmcp.server.providers.base import Provider
 from fastmcp.server.tasks.config import TaskMeta
 from fastmcp.server.telemetry import delegate_span
-from fastmcp.tools.tool import Tool, ToolResult
+from fastmcp.tools.base import Tool, ToolResult
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.versions import VersionSpec
 
@@ -33,17 +32,6 @@ if TYPE_CHECKING:
     from docket.execution import Execution
 
     from fastmcp.server.server import FastMCP
-
-
-def _expand_uri_template(template: str, params: dict[str, Any]) -> str:
-    """Expand a URI template with parameters.
-
-    Simple implementation that handles {name} style placeholders.
-    """
-    result = template
-    for key, value in params.items():
-        result = re.sub(rf"\{{{key}\}}", str(value), result)
-    return result
 
 
 # -----------------------------------------------------------------------------
@@ -86,6 +74,10 @@ class FastMCPProviderTool(Tool):
             tags=tool.tags,
             annotations=tool.annotations,
             task_config=tool.task_config,
+            execution=tool.execution,
+            meta=tool.get_meta(),
+            title=tool.title,
+            icons=tool.icons,
         )
 
     @overload
@@ -120,7 +112,10 @@ class FastMCPProviderTool(Tool):
             self._original_name or "", "FastMCPProvider", self._original_name or ""
         ):
             return await self._server.call_tool(
-                self._original_name, arguments, version=version, task_meta=task_meta
+                self._original_name,
+                arguments,
+                version=version,
+                task_meta=task_meta,
             )
 
     async def run(self, arguments: dict[str, Any]) -> ToolResult:
@@ -183,6 +178,9 @@ class FastMCPProviderResource(Resource):
             tags=resource.tags,
             annotations=resource.annotations,
             task_config=resource.task_config,
+            meta=resource.get_meta(),
+            title=resource.title,
+            icons=resource.icons,
         )
 
     @overload
@@ -249,6 +247,9 @@ class FastMCPProviderPrompt(Prompt):
             arguments=prompt.arguments,
             tags=prompt.tags,
             task_config=prompt.task_config,
+            meta=prompt.get_meta(),
+            title=prompt.title,
+            icons=prompt.icons,
         )
 
     @overload
@@ -350,6 +351,9 @@ class FastMCPProviderResourceTemplate(ResourceTemplate):
             tags=template.tags,
             annotations=template.annotations,
             task_config=template.task_config,
+            meta=template.get_meta(),
+            title=template.title,
+            icons=template.icons,
         )
 
     async def create_resource(self, uri: str, params: dict[str, Any]) -> Resource:
@@ -360,7 +364,7 @@ class FastMCPProviderResourceTemplate(ResourceTemplate):
         URI that the nested server understands.
         """
         # Expand the original template with params to get internal URI
-        original_uri = _expand_uri_template(self._original_uri_template or "", params)
+        original_uri = expand_uri_template(self._original_uri_template or "", params)
         return FastMCPProviderResource(
             server=self._server,
             original_uri=original_uri,
@@ -390,7 +394,7 @@ class FastMCPProviderResourceTemplate(ResourceTemplate):
         server before calling this method.
         """
         # Expand the original template with params to get internal URI
-        original_uri = _expand_uri_template(self._original_uri_template or "", params)
+        original_uri = expand_uri_template(self._original_uri_template or "", params)
 
         # Pass exact version so child reads the correct version
         version = VersionSpec(eq=self.version) if self.version else None
@@ -409,9 +413,7 @@ class FastMCPProviderResourceTemplate(ResourceTemplate):
         This method is called by Docket during background task execution.
         """
         # Expand the original template with arguments to get internal URI
-        original_uri = _expand_uri_template(
-            self._original_uri_template or "", arguments
-        )
+        original_uri = expand_uri_template(self._original_uri_template or "", arguments)
 
         # Pass exact version so child reads the correct version
         version = VersionSpec(eq=self.version) if self.version else None
@@ -531,6 +533,26 @@ class FastMCPProvider(Provider):
         if raw_tool is None:
             return None
         return FastMCPProviderTool.wrap(self.server, raw_tool)
+
+    async def get_app_tool(self, app_name: str, tool_name: str) -> Tool | None:
+        """Delegate to nested server's get_app_tool, wrapping for middleware."""
+        raw_tool = await self.server.get_app_tool(app_name, tool_name)
+        if raw_tool is None:
+            return None
+        wrapped = FastMCPProviderTool.wrap(self.server, raw_tool)
+        from fastmcp.server.providers.addressing import hashed_backend_name
+
+        wrapped._original_name = hashed_backend_name(app_name, tool_name)
+        return wrapped
+
+    async def get_tool_by_hash(self, tool_hash: str, tool_name: str) -> Tool | None:
+        """Delegate to nested server's get_tool_by_hash, wrapping for middleware."""
+        raw_tool = await self.server.get_tool_by_hash(tool_hash, tool_name)
+        if raw_tool is None:
+            return None
+        wrapped = FastMCPProviderTool.wrap(self.server, raw_tool)
+        wrapped._original_name = f"{tool_hash}_{tool_name}"
+        return wrapped
 
     # -------------------------------------------------------------------------
     # Resource methods

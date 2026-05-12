@@ -9,19 +9,21 @@ from __future__ import annotations
 import inspect
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Any, overload
+from typing import TYPE_CHECKING, Any, TypeVar, overload
 
 import mcp.types
 from mcp.types import AnyFunction
 
 import fastmcp
+from fastmcp.prompts.base import Prompt
 from fastmcp.prompts.function_prompt import FunctionPrompt
-from fastmcp.prompts.prompt import Prompt
+from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.tasks.config import TaskConfig
-from fastmcp.tools.tool import AuthCheckCallable
 
 if TYPE_CHECKING:
     from fastmcp.server.providers.local_provider import LocalProvider
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 class PromptDecoratorMixin:
@@ -71,7 +73,7 @@ class PromptDecoratorMixin:
     @overload
     def prompt(
         self: LocalProvider,
-        name_or_fn: AnyFunction,
+        name_or_fn: F,
         *,
         name: str | None = None,
         version: str | int | None = None,
@@ -82,8 +84,8 @@ class PromptDecoratorMixin:
         enabled: bool = True,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
-    ) -> FunctionPrompt: ...
+        auth: AuthCheck | list[AuthCheck] | None = None,
+    ) -> F: ...
 
     @overload
     def prompt(
@@ -99,8 +101,8 @@ class PromptDecoratorMixin:
         enabled: bool = True,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
-    ) -> Callable[[AnyFunction], FunctionPrompt]: ...
+        auth: AuthCheck | list[AuthCheck] | None = None,
+    ) -> Callable[[F], F]: ...
 
     def prompt(
         self: LocalProvider,
@@ -115,7 +117,7 @@ class PromptDecoratorMixin:
         enabled: bool = True,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+        auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> (
         Callable[[AnyFunction], FunctionPrompt]
         | FunctionPrompt
@@ -222,7 +224,7 @@ class PromptDecoratorMixin:
                     enabled=enabled,
                 )
                 target = fn.__func__ if hasattr(fn, "__func__") else fn
-                target.__fastmcp__ = metadata  # type: ignore[attr-defined]
+                target.__fastmcp__ = metadata  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
                 self.add_prompt(fn)
                 return fn
 

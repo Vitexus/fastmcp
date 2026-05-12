@@ -2,18 +2,26 @@
 
 from urllib.parse import parse_qs, urlparse
 
+import pytest
+from key_value.aio.stores.memory import MemoryStore
 from mcp.server.auth.provider import AuthorizationParams
 from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyUrl
 
-from fastmcp.server.auth.providers.azure import OIDC_SCOPES, AzureProvider
-from fastmcp.server.auth.providers.jwt import JWTVerifier
+from fastmcp.server.auth.providers.azure import AzureProvider
+from fastmcp.server.auth.providers.jwt import JWTVerifier, RSAKeyPair
+
+
+@pytest.fixture
+def memory_storage() -> MemoryStore:
+    """Provide a MemoryStore for tests to avoid SQLite initialization on Windows."""
+    return MemoryStore()
 
 
 class TestAzureProvider:
     """Test Azure OAuth provider functionality."""
 
-    def test_init_with_explicit_params(self):
+    def test_init_with_explicit_params(self, memory_storage: MemoryStore):
         """Test AzureProvider initialization with explicit parameters."""
         provider = AzureProvider(
             client_id="12345678-1234-1234-1234-123456789012",
@@ -22,9 +30,11 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             required_scopes=["read", "write"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         assert provider._upstream_client_id == "12345678-1234-1234-1234-123456789012"
+        assert provider._upstream_client_secret is not None
         assert provider._upstream_client_secret.get_secret_value() == "azure_secret_123"
         assert str(provider.base_url) == "https://myserver.com/"
         # Check tenant is in the endpoints
@@ -33,7 +43,7 @@ class TestAzureProvider:
         parsed_token = urlparse(provider._upstream_token_endpoint)
         assert "87654321-4321-4321-4321-210987654321" in parsed_token.path
 
-    def test_init_defaults(self):
+    def test_init_defaults(self, memory_storage: MemoryStore):
         """Test that default values are applied correctly."""
         provider = AzureProvider(
             client_id="test_client",
@@ -42,13 +52,46 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         # Check defaults
         assert provider._redirect_path == "/auth/callback"
         # Azure provider defaults are set but we can't easily verify them without accessing internals
 
-    def test_oauth_endpoints_configured_correctly(self):
+    def test_offline_access_automatically_included(self, memory_storage: MemoryStore):
+        """Test that offline_access is automatically added to get refresh tokens."""
+        # Without specifying offline_access
+        provider = AzureProvider(
+            client_id="test_client",
+            client_secret="test_secret",
+            tenant_id="test-tenant",
+            base_url="https://myserver.com",
+            required_scopes=["read"],
+            jwt_signing_key="test-secret",
+            client_storage=memory_storage,
+        )
+
+        assert "offline_access" in provider.additional_authorize_scopes
+
+    def test_offline_access_not_duplicated(self, memory_storage: MemoryStore):
+        """Test that offline_access is not duplicated if already specified."""
+        provider = AzureProvider(
+            client_id="test_client",
+            client_secret="test_secret",
+            tenant_id="test-tenant",
+            base_url="https://myserver.com",
+            required_scopes=["read"],
+            additional_authorize_scopes=["User.Read", "offline_access"],
+            jwt_signing_key="test-secret",
+            client_storage=memory_storage,
+        )
+
+        # Should appear exactly once
+        assert provider.additional_authorize_scopes.count("offline_access") == 1
+        assert "User.Read" in provider.additional_authorize_scopes
+
+    def test_oauth_endpoints_configured_correctly(self, memory_storage: MemoryStore):
         """Test that OAuth endpoints are configured correctly."""
         provider = AzureProvider(
             client_id="test_client",
@@ -57,6 +100,7 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             required_scopes=["read"],
             jwt_signing_key="test_secret",
+            client_storage=memory_storage,
         )
 
         # Check that endpoints use the correct Azure OAuth2 v2.0 endpoints with tenant
@@ -72,7 +116,7 @@ class TestAzureProvider:
             provider._upstream_revocation_endpoint is None
         )  # Azure doesn't support revocation
 
-    def test_special_tenant_values(self):
+    def test_special_tenant_values(self, memory_storage: MemoryStore):
         """Test that special tenant values are accepted."""
         # Test with "organizations"
         provider1 = AzureProvider(
@@ -82,6 +126,7 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
         parsed = urlparse(provider1._upstream_authorization_endpoint)
         assert "/organizations/" in parsed.path
@@ -94,11 +139,12 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
         parsed = urlparse(provider2._upstream_authorization_endpoint)
         assert "/consumers/" in parsed.path
 
-    def test_azure_specific_scopes(self):
+    def test_azure_specific_scopes(self, memory_storage: MemoryStore):
         """Test handling of custom API scope formats."""
         # Test that the provider accepts custom API scopes without error
         provider = AzureProvider(
@@ -112,6 +158,7 @@ class TestAzureProvider:
                 "admin",
             ],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         # Provider should initialize successfully with these scopes
@@ -124,7 +171,9 @@ class TestAzureProvider:
             "admin",
         ]
 
-    def test_init_does_not_require_api_client_id_anymore(self):
+    def test_init_does_not_require_api_client_id_anymore(
+        self, memory_storage: MemoryStore
+    ):
         """API client ID is no longer required; audience is client_id."""
         provider = AzureProvider(
             client_id="test_client",
@@ -133,13 +182,14 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
         assert provider is not None
 
-    def test_init_with_custom_audience_uses_jwt_verifier(self):
+    def test_init_with_custom_audience_uses_jwt_verifier(
+        self, memory_storage: MemoryStore
+    ):
         """When audience is provided, JWTVerifier is configured with JWKS and issuer."""
-        from fastmcp.server.auth.providers.jwt import JWTVerifier
-
         provider = AzureProvider(
             client_id="test_client",
             client_secret="test_secret",
@@ -148,6 +198,7 @@ class TestAzureProvider:
             identifier_uri="api://my-api",
             required_scopes=[".default"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         assert provider._token_validator is not None
@@ -158,12 +209,103 @@ class TestAzureProvider:
             "https://login.microsoftonline.com/my-tenant/discovery/v2.0/keys"
         )
         assert verifier.issuer == "https://login.microsoftonline.com/my-tenant/v2.0"
-        assert verifier.audience == "test_client"
+        assert verifier.audience == ["test_client", "api://my-api"]
         # Scopes are stored unprefixed for token validation
         # (Azure returns unprefixed scopes like ".default" in JWT tokens)
         assert verifier.required_scopes == [".default"]
 
-    async def test_authorize_filters_resource_and_stores_unprefixed_scopes(self):
+    async def test_token_accepted_with_client_id_audience(
+        self, memory_storage: MemoryStore
+    ):
+        """Azure AD v2 tokens use the bare client_id as aud — must be accepted."""
+        key_pair = RSAKeyPair.generate()
+        provider = AzureProvider(
+            client_id="test_client",
+            client_secret="test_secret",
+            tenant_id="my-tenant",
+            base_url="https://myserver.com",
+            identifier_uri="api://my-api",
+            required_scopes=["read"],
+            jwt_signing_key="test-secret",
+            client_storage=memory_storage,
+        )
+
+        assert isinstance(provider._token_validator, JWTVerifier)
+        verifier = provider._token_validator
+        verifier.public_key = key_pair.public_key
+        verifier.jwks_uri = None
+
+        token = key_pair.create_token(
+            subject="test-user",
+            issuer="https://login.microsoftonline.com/my-tenant/v2.0",
+            audience="test_client",
+            additional_claims={"scp": "read"},
+        )
+        result = await verifier.load_access_token(token)
+        assert result is not None
+
+    async def test_token_accepted_with_identifier_uri_audience(
+        self, memory_storage: MemoryStore
+    ):
+        """Azure AD v1 tokens use the identifier_uri as aud — must be accepted."""
+        key_pair = RSAKeyPair.generate()
+        provider = AzureProvider(
+            client_id="test_client",
+            client_secret="test_secret",
+            tenant_id="my-tenant",
+            base_url="https://myserver.com",
+            identifier_uri="api://my-api",
+            required_scopes=["read"],
+            jwt_signing_key="test-secret",
+            client_storage=memory_storage,
+        )
+
+        assert isinstance(provider._token_validator, JWTVerifier)
+        verifier = provider._token_validator
+        verifier.public_key = key_pair.public_key
+        verifier.jwks_uri = None
+
+        token = key_pair.create_token(
+            subject="test-user",
+            issuer="https://login.microsoftonline.com/my-tenant/v2.0",
+            audience="api://my-api",
+            additional_claims={"scp": "read"},
+        )
+        result = await verifier.load_access_token(token)
+        assert result is not None
+
+    async def test_token_rejected_with_wrong_audience(
+        self, memory_storage: MemoryStore
+    ):
+        """Tokens for a different application must be rejected."""
+        key_pair = RSAKeyPair.generate()
+        provider = AzureProvider(
+            client_id="test_client",
+            client_secret="test_secret",
+            tenant_id="my-tenant",
+            base_url="https://myserver.com",
+            required_scopes=["read"],
+            jwt_signing_key="test-secret",
+            client_storage=memory_storage,
+        )
+
+        assert isinstance(provider._token_validator, JWTVerifier)
+        verifier = provider._token_validator
+        verifier.public_key = key_pair.public_key
+        verifier.jwks_uri = None
+
+        token = key_pair.create_token(
+            subject="test-user",
+            issuer="https://login.microsoftonline.com/my-tenant/v2.0",
+            audience="wrong-app-id",
+            additional_claims={"scp": "read"},
+        )
+        result = await verifier.load_access_token(token)
+        assert result is None
+
+    async def test_authorize_filters_resource_and_stores_unprefixed_scopes(
+        self, memory_storage: MemoryStore
+    ):
         """authorize() should drop resource parameter and store unprefixed scopes for MCP clients."""
         provider = AzureProvider(
             client_id="test_client",
@@ -173,6 +315,7 @@ class TestAzureProvider:
             required_scopes=["read", "write"],
             base_url="https://srv.example",
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         await provider.register_client(
@@ -230,7 +373,9 @@ class TestAzureProvider:
             or "api://my-api/write" in upstream_url
         )
 
-    async def test_authorize_appends_additional_scopes(self):
+    async def test_authorize_appends_additional_scopes(
+        self, memory_storage: MemoryStore
+    ):
         """authorize() should append additional_authorize_scopes to the authorization request."""
         provider = AzureProvider(
             client_id="test_client",
@@ -241,6 +386,7 @@ class TestAzureProvider:
             base_url="https://srv.example",
             additional_authorize_scopes=["Mail.Read", "User.Read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         await provider.register_client(
@@ -292,7 +438,7 @@ class TestAzureProvider:
         assert "Mail.Read" in upstream_url
         assert "User.Read" in upstream_url
 
-    def test_base_authority_defaults_to_public_cloud(self):
+    def test_base_authority_defaults_to_public_cloud(self, memory_storage: MemoryStore):
         """Test that base_authority defaults to login.microsoftonline.com."""
         provider = AzureProvider(
             client_id="test_client",
@@ -301,6 +447,7 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         assert (
@@ -321,7 +468,7 @@ class TestAzureProvider:
             == "https://login.microsoftonline.com/test-tenant/discovery/v2.0/keys"
         )
 
-    def test_base_authority_azure_government(self):
+    def test_base_authority_azure_government(self, memory_storage: MemoryStore):
         """Test Azure Government endpoints with login.microsoftonline.us."""
         provider = AzureProvider(
             client_id="test_client",
@@ -331,6 +478,7 @@ class TestAzureProvider:
             required_scopes=["read"],
             base_authority="login.microsoftonline.us",
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         assert (
@@ -351,7 +499,7 @@ class TestAzureProvider:
             == "https://login.microsoftonline.us/gov-tenant-id/discovery/v2.0/keys"
         )
 
-    def test_base_authority_from_parameter(self):
+    def test_base_authority_from_parameter(self, memory_storage: MemoryStore):
         """Test that base_authority can be set via parameter."""
         provider = AzureProvider(
             client_id="env-client-id",
@@ -361,6 +509,7 @@ class TestAzureProvider:
             required_scopes=["read"],
             base_authority="login.microsoftonline.us",
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         assert (
@@ -381,7 +530,9 @@ class TestAzureProvider:
             == "https://login.microsoftonline.us/env-tenant-id/discovery/v2.0/keys"
         )
 
-    def test_base_authority_with_special_tenant_values(self):
+    def test_base_authority_with_special_tenant_values(
+        self, memory_storage: MemoryStore
+    ):
         """Test that base_authority works with special tenant values like 'organizations'."""
         provider = AzureProvider(
             client_id="test_client",
@@ -391,13 +542,16 @@ class TestAzureProvider:
             required_scopes=["read"],
             base_authority="login.microsoftonline.us",
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         parsed = urlparse(provider._upstream_authorization_endpoint)
         assert parsed.netloc == "login.microsoftonline.us"
         assert "/organizations/" in parsed.path
 
-    def test_prepare_scopes_for_upstream_refresh_basic_prefixing(self):
+    def test_prepare_scopes_for_upstream_refresh_basic_prefixing(
+        self, memory_storage: MemoryStore
+    ):
         """Test that unprefixed scopes are correctly prefixed for Azure token refresh."""
         provider = AzureProvider(
             client_id="test_client",
@@ -407,6 +561,7 @@ class TestAzureProvider:
             identifier_uri="api://my-api",
             required_scopes=["read", "write"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         # Unprefixed scopes from storage should be prefixed
@@ -414,9 +569,12 @@ class TestAzureProvider:
 
         assert "api://my-api/read" in result
         assert "api://my-api/write" in result
-        assert len(result) == 2
+        assert "offline_access" in result  # Auto-included for refresh tokens
+        assert len(result) == 3
 
-    def test_prepare_scopes_for_upstream_refresh_already_prefixed(self):
+    def test_prepare_scopes_for_upstream_refresh_already_prefixed(
+        self, memory_storage: MemoryStore
+    ):
         """Test that already-prefixed scopes remain unchanged."""
         provider = AzureProvider(
             client_id="test_client",
@@ -426,6 +584,7 @@ class TestAzureProvider:
             identifier_uri="api://my-api",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         # Already prefixed scopes should pass through unchanged
@@ -435,10 +594,17 @@ class TestAzureProvider:
 
         assert "api://my-api/read" in result
         assert "api://other-api/admin" in result
-        assert len(result) == 2
+        assert "offline_access" in result  # Auto-included for refresh tokens
+        assert len(result) == 3
 
-    def test_prepare_scopes_for_upstream_refresh_with_additional_scopes(self):
-        """Test that additional_authorize_scopes are added during token refresh."""
+    def test_prepare_scopes_for_upstream_refresh_with_additional_scopes(
+        self, memory_storage: MemoryStore
+    ):
+        """Test that only OIDC scopes from additional_authorize_scopes are added.
+
+        Azure only allows ONE resource per token request (AADSTS28000), so
+        non-OIDC scopes like User.Read are excluded from refresh requests.
+        """
         provider = AzureProvider(
             client_id="test_client",
             client_secret="test_secret",
@@ -447,27 +613,29 @@ class TestAzureProvider:
             identifier_uri="api://my-api",
             required_scopes=["read"],
             additional_authorize_scopes=[
-                "User.Read",
+                "User.Read",  # Not OIDC - excluded
                 "openid",
                 "profile",
                 "offline_access",
             ],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
-        # Base scopes should be prefixed, additional scopes appended
+        # Base scopes should be prefixed, only OIDC scopes appended
         result = provider._prepare_scopes_for_upstream_refresh(["read", "write"])
 
         assert "api://my-api/read" in result
         assert "api://my-api/write" in result
-        assert "User.Read" in result
+        assert "User.Read" not in result  # Not OIDC, excluded
         assert "openid" in result
         assert "profile" in result
         assert "offline_access" in result
-        assert len(result) == 6
+        assert len(result) == 5
 
     def test_prepare_scopes_for_upstream_refresh_filters_duplicate_additional_scopes(
         self,
+        memory_storage: MemoryStore,
     ):
         """Test that accidentally stored additional_authorize_scopes are filtered out."""
         provider = AzureProvider(
@@ -479,21 +647,26 @@ class TestAzureProvider:
             required_scopes=["read"],
             additional_authorize_scopes=["User.Read", "openid"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         # If additional scopes were accidentally stored, they should be filtered
-        # to prevent accumulation
+        # User.Read is not OIDC so won't be added
         result = provider._prepare_scopes_for_upstream_refresh(
             ["read", "User.Read", "openid"]
         )
 
-        # Should have: api://my-api/read (prefixed) + User.Read + openid (added once)
+        # Should have: api://my-api/read (prefixed) + openid + offline_access (OIDC scopes)
+        # User.Read is filtered from storage AND not added (not OIDC)
         assert "api://my-api/read" in result
-        assert result.count("User.Read") == 1
+        assert "User.Read" not in result  # Not OIDC
         assert result.count("openid") == 1
+        assert "offline_access" in result  # Auto-included and is OIDC
         assert len(result) == 3
 
-    def test_prepare_scopes_for_upstream_refresh_mixed_scopes(self):
+    def test_prepare_scopes_for_upstream_refresh_mixed_scopes(
+        self, memory_storage: MemoryStore
+    ):
         """Test mixed scenario with both prefixed and unprefixed scopes."""
         provider = AzureProvider(
             client_id="test_client",
@@ -502,8 +675,9 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             identifier_uri="api://my-api",
             required_scopes=["read"],
-            additional_authorize_scopes=["User.Read"],
+            additional_authorize_scopes=["openid"],  # OIDC scope
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         # Mix of prefixed and unprefixed scopes
@@ -514,10 +688,13 @@ class TestAzureProvider:
         assert "api://my-api/read" in result
         assert "api://other-api/admin" in result  # Already prefixed, unchanged
         assert "api://my-api/write" in result
-        assert "User.Read" in result
-        assert len(result) == 4
+        assert "openid" in result
+        assert "offline_access" in result  # Auto-included
+        assert len(result) == 5
 
-    def test_prepare_scopes_for_upstream_refresh_scope_with_slash(self):
+    def test_prepare_scopes_for_upstream_refresh_scope_with_slash(
+        self, memory_storage: MemoryStore
+    ):
         """Test that scopes containing '/' are not prefixed."""
         provider = AzureProvider(
             client_id="test_client",
@@ -527,6 +704,7 @@ class TestAzureProvider:
             identifier_uri="api://my-api",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         # Scopes with "/" should not be prefixed (already fully qualified)
@@ -539,7 +717,9 @@ class TestAzureProvider:
             "https://graph.microsoft.com/.default" in result
         )  # Not prefixed (contains ://)
 
-    def test_prepare_scopes_for_upstream_refresh_empty_scopes(self):
+    def test_prepare_scopes_for_upstream_refresh_empty_scopes(
+        self, memory_storage: MemoryStore
+    ):
         """Test behavior with empty scopes list."""
         provider = AzureProvider(
             client_id="test_client",
@@ -550,16 +730,20 @@ class TestAzureProvider:
             required_scopes=["read"],
             additional_authorize_scopes=["User.Read", "openid"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
-        # Empty scopes should still add additional_authorize_scopes
+        # Empty scopes should still add OIDC scopes (not User.Read)
         result = provider._prepare_scopes_for_upstream_refresh([])
 
-        assert "User.Read" in result
+        assert "User.Read" not in result  # Not OIDC
         assert "openid" in result
-        assert len(result) == 2
+        assert "offline_access" in result  # Auto-included
+        assert len(result) == 2  # Only OIDC scopes: openid + offline_access
 
-    def test_prepare_scopes_for_upstream_refresh_no_additional_scopes(self):
+    def test_prepare_scopes_for_upstream_refresh_no_additional_scopes(
+        self, memory_storage: MemoryStore
+    ):
         """Test behavior when no additional_authorize_scopes are configured."""
         provider = AzureProvider(
             client_id="test_client",
@@ -569,16 +753,20 @@ class TestAzureProvider:
             identifier_uri="api://my-api",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
-        # Should only prefix base scopes, no additional scopes added
+        # Should prefix base scopes, plus auto-added offline_access
         result = provider._prepare_scopes_for_upstream_refresh(["read", "write"])
 
         assert "api://my-api/read" in result
         assert "api://my-api/write" in result
-        assert len(result) == 2
+        assert "offline_access" in result  # Auto-included
+        assert len(result) == 3
 
-    def test_prepare_scopes_for_upstream_refresh_deduplicates_scopes(self):
+    def test_prepare_scopes_for_upstream_refresh_deduplicates_scopes(
+        self, memory_storage: MemoryStore
+    ):
         """Test that duplicate scopes are deduplicated while preserving order."""
         provider = AzureProvider(
             client_id="test_client",
@@ -587,25 +775,29 @@ class TestAzureProvider:
             base_url="https://myserver.com",
             identifier_uri="api://my-api",
             required_scopes=["read"],
-            additional_authorize_scopes=["User.Read", "openid"],
+            additional_authorize_scopes=["openid", "profile"],  # OIDC scopes only
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
-        # Test with duplicate base scopes and duplicate additional scopes
+        # Test with duplicate base scopes
         result = provider._prepare_scopes_for_upstream_refresh(
-            ["read", "write", "read", "User.Read", "openid"]
+            ["read", "write", "read", "openid"]
         )
 
-        # Should have deduplicated results in order
+        # Should have deduplicated results in order (OIDC scopes added, offline_access auto-added)
         assert result == [
             "api://my-api/read",
             "api://my-api/write",
-            "User.Read",
             "openid",
+            "profile",
+            "offline_access",
         ]
-        assert len(result) == 4
+        assert len(result) == 5
 
-    def test_prepare_scopes_for_upstream_refresh_deduplicates_prefixed_variants(self):
+    def test_prepare_scopes_for_upstream_refresh_deduplicates_prefixed_variants(
+        self, memory_storage: MemoryStore
+    ):
         """Test that both prefixed and unprefixed variants are deduplicated."""
         provider = AzureProvider(
             client_id="test_client",
@@ -615,6 +807,7 @@ class TestAzureProvider:
             identifier_uri="api://my-api",
             required_scopes=["read"],
             jwt_signing_key="test-secret",
+            client_storage=memory_storage,
         )
 
         # Test with both prefixed and unprefixed variants of same scope
@@ -625,426 +818,7 @@ class TestAzureProvider:
         # Should deduplicate - first occurrence wins (api://my-api/read from "read")
         assert "api://my-api/read" in result
         assert "api://my-api/write" in result
-        # Should only have 2 items (read processed twice, but deduplicated)
-        assert len(result) == 2
+        assert "offline_access" in result  # Auto-included
+        # Should have 3 items (read deduplicated, plus offline_access)
+        assert len(result) == 3
         assert result.count("api://my-api/read") == 1
-
-
-class TestOIDCScopeHandling:
-    """Tests for OIDC scope handling in Azure provider.
-
-    Azure access tokens do NOT include OIDC scopes (openid, profile, email,
-    offline_access) in the `scp` claim - they're only used during authorization.
-    These tests verify that:
-    1. OIDC scopes are never prefixed with identifier_uri
-    2. OIDC scopes are filtered from token validation
-    3. OIDC scopes are still advertised to clients via valid_scopes
-    """
-
-    def test_oidc_scopes_constant(self):
-        """Verify OIDC_SCOPES contains the standard OIDC scopes."""
-        assert OIDC_SCOPES == {"openid", "profile", "email", "offline_access"}
-
-    def test_prefix_scopes_does_not_prefix_oidc_scopes(self):
-        """Test that _prefix_scopes_for_azure never prefixes OIDC scopes."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            identifier_uri="api://my-api",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        # All OIDC scopes should pass through unchanged
-        result = provider._prefix_scopes_for_azure(
-            ["openid", "profile", "email", "offline_access"]
-        )
-
-        assert result == ["openid", "profile", "email", "offline_access"]
-
-    def test_prefix_scopes_mixed_oidc_and_custom(self):
-        """Test prefixing with a mix of OIDC and custom scopes."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            identifier_uri="api://my-api",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        result = provider._prefix_scopes_for_azure(
-            ["read", "openid", "write", "profile"]
-        )
-
-        # Custom scopes should be prefixed, OIDC scopes should not
-        assert "api://my-api/read" in result
-        assert "api://my-api/write" in result
-        assert "openid" in result
-        assert "profile" in result
-        # Verify OIDC scopes are NOT prefixed
-        assert "api://my-api/openid" not in result
-        assert "api://my-api/profile" not in result
-
-    def test_prefix_scopes_dot_notation_gets_prefixed(self):
-        """Test that dot-notation scopes get prefixed (use additional_authorize_scopes for Graph)."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            identifier_uri="api://my-api",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        # Dot-notation scopes ARE prefixed - use additional_authorize_scopes for Graph
-        # or fully-qualified format like https://graph.microsoft.com/User.Read
-        result = provider._prefix_scopes_for_azure(["my.scope", "admin.read"])
-
-        assert result == ["api://my-api/my.scope", "api://my-api/admin.read"]
-
-    def test_prefix_scopes_fully_qualified_graph_not_prefixed(self):
-        """Test that fully-qualified Graph scopes are not prefixed."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            identifier_uri="api://my-api",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        result = provider._prefix_scopes_for_azure(
-            [
-                "https://graph.microsoft.com/User.Read",
-                "https://graph.microsoft.com/Mail.Send",
-            ]
-        )
-
-        # Fully-qualified URIs pass through unchanged
-        assert result == [
-            "https://graph.microsoft.com/User.Read",
-            "https://graph.microsoft.com/Mail.Send",
-        ]
-
-    def test_required_scopes_with_oidc_filters_validation(self):
-        """Test that OIDC scopes in required_scopes are filtered from token validation."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            identifier_uri="api://my-api",
-            required_scopes=["read", "openid", "profile"],
-            jwt_signing_key="test-secret",
-        )
-
-        # Token validator should only require non-OIDC scopes
-        assert provider._token_validator.required_scopes == ["read"]
-
-    def test_required_scopes_all_oidc_results_in_no_validation(self):
-        """Test that if all required_scopes are OIDC, no scope validation occurs."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            identifier_uri="api://my-api",
-            required_scopes=["openid", "profile"],
-            jwt_signing_key="test-secret",
-        )
-
-        # Token validator should have empty required scopes (all were OIDC)
-        assert provider._token_validator.required_scopes == []
-
-    def test_valid_scopes_includes_oidc_scopes(self):
-        """Test that valid_scopes advertises OIDC scopes to clients."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            identifier_uri="api://my-api",
-            required_scopes=["read", "openid", "profile"],
-            jwt_signing_key="test-secret",
-        )
-
-        # required_scopes (used for validation) excludes OIDC scopes
-        assert provider.required_scopes == ["read"]
-        # But valid_scopes (advertised to clients) includes all scopes
-        assert provider.client_registration_options is not None
-        assert provider.client_registration_options.valid_scopes == [
-            "read",
-            "openid",
-            "profile",
-        ]
-
-    def test_prepare_scopes_for_refresh_handles_oidc_scopes(self):
-        """Test that token refresh correctly handles OIDC scopes."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            identifier_uri="api://my-api",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        # Simulate stored scopes that include OIDC scopes
-        result = provider._prepare_scopes_for_upstream_refresh(
-            ["read", "openid", "profile"]
-        )
-
-        # Custom scope should be prefixed, OIDC scopes should not
-        assert "api://my-api/read" in result
-        assert "openid" in result
-        assert "profile" in result
-        assert "api://my-api/openid" not in result
-        assert "api://my-api/profile" not in result
-
-
-class TestAzureExtractUpstreamClaims:
-    """Tests for Azure provider's _extract_upstream_claims method."""
-
-    @staticmethod
-    def create_test_jwt(claims: dict) -> str:
-        """Create a test JWT token with the given claims."""
-        import base64
-        import json
-
-        header = base64.urlsafe_b64encode(
-            json.dumps({"alg": "RS256", "typ": "JWT"}).encode()
-        ).rstrip(b"=")
-        payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).rstrip(b"=")
-        signature = base64.urlsafe_b64encode(b"fake-signature").rstrip(b"=")
-        return f"{header.decode()}.{payload.decode()}.{signature.decode()}"
-
-    async def test_extract_claims_from_azure_jwt(self):
-        """Test that Azure identity claims are extracted from access token."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        azure_jwt = self.create_test_jwt(
-            {
-                "sub": "user-subject-id",
-                "oid": "user-object-id",
-                "tid": "tenant-id-123",
-                "azp": "client-app-id",
-                "name": "Test User",
-                "given_name": "Test",
-                "family_name": "User",
-                "preferred_username": "testuser@example.com",
-                "upn": "testuser@example.com",
-                "email": "test@example.com",
-                "roles": ["Admin", "Reader"],
-                "groups": ["group-1", "group-2"],
-                "exp": 9999999999,
-                "iat": 1234567890,
-                "iss": "https://login.microsoftonline.com/test-tenant/v2.0",
-            }
-        )
-
-        idp_tokens = {
-            "access_token": azure_jwt,
-            "token_type": "Bearer",
-            "expires_in": 3600,
-        }
-
-        claims = await provider._extract_upstream_claims(idp_tokens)
-
-        assert claims is not None
-        assert claims["sub"] == "user-subject-id"
-        assert claims["oid"] == "user-object-id"
-        assert claims["tid"] == "tenant-id-123"
-        assert claims["azp"] == "client-app-id"
-        assert claims["name"] == "Test User"
-        assert claims["given_name"] == "Test"
-        assert claims["family_name"] == "User"
-        assert claims["preferred_username"] == "testuser@example.com"
-        assert claims["upn"] == "testuser@example.com"
-        assert claims["email"] == "test@example.com"
-        assert claims["roles"] == ["Admin", "Reader"]
-        assert claims["groups"] == ["group-1", "group-2"]
-
-    async def test_extract_claims_only_includes_identity_claims(self):
-        """Test that only identity claims are extracted, not all JWT claims."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        azure_jwt = self.create_test_jwt(
-            {
-                "sub": "user-id",
-                "oid": "object-id",
-                "name": "Test User",
-                "exp": 9999999999,
-                "iat": 1234567890,
-                "iss": "https://issuer.example.com",
-                "aud": "test-audience",
-                "nbf": 1234567890,
-                "scp": "read write",
-                "azp": "some-client",
-            }
-        )
-
-        idp_tokens = {"access_token": azure_jwt}
-
-        claims = await provider._extract_upstream_claims(idp_tokens)
-
-        # Only identity claims should be present
-        assert claims is not None
-        assert "sub" in claims
-        assert "oid" in claims
-        assert "name" in claims
-        assert "azp" in claims  # azp is an identity claim we extract
-        # Standard JWT claims should NOT be extracted
-        assert "exp" not in claims
-        assert "iat" not in claims
-        assert "iss" not in claims
-        assert "aud" not in claims
-        assert "nbf" not in claims
-        assert "scp" not in claims
-
-    async def test_extract_claims_returns_none_for_missing_access_token(self):
-        """Test that None is returned when access_token is missing."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        idp_tokens = {"token_type": "Bearer", "expires_in": 3600}
-
-        claims = await provider._extract_upstream_claims(idp_tokens)
-
-        assert claims is None
-
-    async def test_extract_claims_returns_none_for_opaque_token(self):
-        """Test that None is returned for opaque (non-JWT) tokens."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        idp_tokens = {
-            "access_token": "gho_opaque_token_not_a_jwt",  # Not a JWT
-            "token_type": "Bearer",
-        }
-
-        claims = await provider._extract_upstream_claims(idp_tokens)
-
-        assert claims is None
-
-    async def test_extract_claims_returns_none_for_malformed_jwt(self):
-        """Test that None is returned for malformed JWT tokens."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        # Only two parts (missing signature)
-        idp_tokens = {"access_token": "header.payload"}
-
-        claims = await provider._extract_upstream_claims(idp_tokens)
-
-        assert claims is None
-
-    async def test_extract_claims_returns_none_for_invalid_base64(self):
-        """Test that None is returned for JWT with invalid base64."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        # Invalid base64 in payload
-        idp_tokens = {"access_token": "header.not-valid-base64!!!.signature"}
-
-        claims = await provider._extract_upstream_claims(idp_tokens)
-
-        assert claims is None
-
-    async def test_extract_claims_returns_none_for_empty_identity_claims(self):
-        """Test that None is returned when no identity claims are present."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        # JWT with only standard claims, no identity claims
-        azure_jwt = self.create_test_jwt(
-            {
-                "exp": 9999999999,
-                "iat": 1234567890,
-                "iss": "https://issuer.example.com",
-                "aud": "test-audience",
-            }
-        )
-
-        idp_tokens = {"access_token": azure_jwt}
-
-        claims = await provider._extract_upstream_claims(idp_tokens)
-
-        assert claims is None
-
-    async def test_extract_claims_partial_identity_claims(self):
-        """Test extraction when only some identity claims are present."""
-        provider = AzureProvider(
-            client_id="test_client",
-            client_secret="test_secret",
-            tenant_id="test-tenant",
-            base_url="https://myserver.com",
-            required_scopes=["read"],
-            jwt_signing_key="test-secret",
-        )
-
-        # JWT with only sub and name
-        azure_jwt = self.create_test_jwt(
-            {
-                "sub": "user-id",
-                "name": "Test User",
-                "exp": 9999999999,
-            }
-        )
-
-        idp_tokens = {"access_token": azure_jwt}
-
-        claims = await provider._extract_upstream_claims(idp_tokens)
-
-        assert claims is not None
-        assert claims == {"sub": "user-id", "name": "Test User"}

@@ -9,6 +9,7 @@ from fastmcp.cli.install.cursor import (
     cursor_command,
     generate_cursor_deeplink,
     install_cursor,
+    install_cursor_workspace,
     open_deeplink,
 )
 from fastmcp.mcp_config import StdioMCPServer
@@ -181,7 +182,7 @@ class TestOpenDeeplink:
         """Test opening deeplink on Windows."""
         with patch("sys.platform", "win32"):
             with patch(
-                "fastmcp.cli.install.cursor.os.startfile", create=True
+                "fastmcp.cli.install.shared.os.startfile", create=True
             ) as mock_startfile:
                 result = open_deeplink("cursor://test")
 
@@ -251,7 +252,7 @@ class TestOpenDeeplink:
         """Test handling of OSError on Windows."""
         with patch("sys.platform", "win32"):
             with patch(
-                "fastmcp.cli.install.cursor.os.startfile", create=True
+                "fastmcp.cli.install.shared.os.startfile", create=True
             ) as mock_startfile:
                 mock_startfile.side_effect = OSError("File not found")
                 result = open_deeplink("cursor://test")
@@ -355,6 +356,20 @@ class TestInstallCursor:
         assert result is False
         # Verify failure message was printed
         mock_print.assert_called()
+
+    def test_install_cursor_workspace_path_is_file(self, tmp_path):
+        """Test that passing a file as workspace_path returns False."""
+        file_path = tmp_path / "somefile.txt"
+        file_path.write_text("hello")
+
+        result = install_cursor_workspace(
+            file=Path("/path/to/server.py"),
+            server_object=None,
+            name="test-server",
+            workspace_path=file_path,
+        )
+
+        assert result is False
 
     def test_install_cursor_deduplicate_packages(self):
         """Test that duplicate packages are deduplicated."""

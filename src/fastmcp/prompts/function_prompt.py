@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import json
 import warnings
@@ -19,18 +20,23 @@ from typing import (
 
 import pydantic_core
 from mcp.types import Icon
+from pydantic.json_schema import SkipJsonSchema
 
 import fastmcp
 from fastmcp.decorators import resolve_task_config
-from fastmcp.exceptions import PromptError
-from fastmcp.prompts.prompt import Prompt, PromptArgument, PromptResult
+from fastmcp.exceptions import FastMCPDeprecationWarning, PromptError
+from fastmcp.prompts.base import Prompt, PromptArgument, PromptResult
+from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.dependencies import (
     transform_context_annotations,
     without_injected_parameters,
 )
 from fastmcp.server.tasks.config import TaskConfig
-from fastmcp.tools.tool import AuthCheckCallable
-from fastmcp.utilities.async_utils import call_sync_fn_in_threadpool
+from fastmcp.utilities.async_utils import (
+    call_sync_fn_in_threadpool,
+    is_coroutine_function,
+)
+from fastmcp.utilities.docstring_parsing import ParsedDocstring, parse_docstring
 from fastmcp.utilities.json_schema import compress_schema
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import get_cached_typeadapter
@@ -66,14 +72,14 @@ class PromptMeta:
     tags: set[str] | None = None
     meta: dict[str, Any] | None = None
     task: bool | TaskConfig | None = None
-    auth: AuthCheckCallable | list[AuthCheckCallable] | None = None
+    auth: AuthCheck | list[AuthCheck] | None = None
     enabled: bool = True
 
 
 class FunctionPrompt(Prompt):
     """A prompt that is a function."""
 
-    fn: Callable[..., Any]
+    fn: SkipJsonSchema[Callable[..., Any]]
 
     @classmethod
     def from_function(
@@ -90,7 +96,7 @@ class FunctionPrompt(Prompt):
         tags: set[str] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+        auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> FunctionPrompt:
         """Create a Prompt from a function.
 
@@ -147,7 +153,9 @@ class FunctionPrompt(Prompt):
             if param.kind == inspect.Parameter.VAR_KEYWORD:
                 raise ValueError("Functions with **kwargs are not supported as prompts")
 
-        description = metadata.description or inspect.getdoc(fn)
+        # Parse the outer docstring (before unwrapping) to preserve the class
+        # docstring as the prompt description for callable class instances.
+        outer_docstring = parse_docstring(fn)
 
         # Normalize task to TaskConfig and validate
         task_value = metadata.task
@@ -160,11 +168,29 @@ class FunctionPrompt(Prompt):
         task_config.validate_function(fn, func_name)
 
         # if the fn is a callable class, we need to get the __call__ method from here out
-        if not inspect.isroutine(fn):
+        if not inspect.isroutine(fn) and not isinstance(fn, functools.partial):
             fn = fn.__call__
         # if the fn is a staticmethod, we need to work with the underlying function
         if isinstance(fn, staticmethod):
             fn = fn.__func__
+
+        # For callable classes, argument descriptions must come from
+        # __call__'s docstring — where the exposed parameters are actually
+        # declared. The class docstring's Args section, if any, typically
+        # describes __init__, so falling back to it would risk injecting
+        # constructor docs into __call__'s arguments on overlapping names.
+        # The description, however, comes from the class docstring (which
+        # describes what the prompt IS) when present.
+        inner_docstring = parse_docstring(fn)
+        parsed_docstring = ParsedDocstring(
+            description=outer_docstring.description or inner_docstring.description,
+            parameters=inner_docstring.parameters,
+        )
+        description = (
+            metadata.description
+            if metadata.description is not None
+            else parsed_docstring.description
+        )
 
         # Transform Context type annotations to Depends() for unified DI
         fn = transform_context_annotations(fn)
@@ -174,6 +200,18 @@ class FunctionPrompt(Prompt):
         type_adapter = get_cached_typeadapter(wrapped_fn)
         parameters = type_adapter.json_schema()
         parameters = compress_schema(parameters, prune_titles=True)
+
+        # Inject parameter descriptions from the docstring into the schema.
+        # Explicit annotations (Field(description=...), Annotated[x, "..."])
+        # already have a "description" key and take precedence.
+        if parsed_docstring.parameters:
+            properties = parameters.get("properties", {})
+            for param_name, param_desc in parsed_docstring.parameters.items():
+                if (
+                    param_name in properties
+                    and "description" not in properties[param_name]
+                ):
+                    properties[param_name]["description"] = param_desc
 
         # Convert parameters to PromptArguments
         arguments: list[PromptArgument] = []
@@ -297,13 +335,27 @@ class FunctionPrompt(Prompt):
             # Convert string arguments to expected types BEFORE validation
             kwargs = self._convert_string_arguments(kwargs)
 
+            # Filter out arguments that aren't in the function signature
+            # This is important for security: dependencies should not be overridable
+            # from external callers. self.fn is wrapped by without_injected_parameters,
+            # so we only accept arguments that are in the wrapped function's signature.
+            sig = inspect.signature(self.fn)
+            valid_params = set(sig.parameters.keys())
+            kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+
+            # Use type adapter to validate arguments and handle Field() defaults
+            # This matches the behavior of tools in function_tool
+            type_adapter = get_cached_typeadapter(self.fn)
+
             # self.fn is wrapped by without_injected_parameters which handles
             # dependency resolution internally
-            if inspect.iscoroutinefunction(self.fn):
-                result = await self.fn(**kwargs)
+            if is_coroutine_function(self.fn):
+                result = await type_adapter.validate_python(kwargs)
             else:
                 # Run sync functions in threadpool to avoid blocking the event loop
-                result = await call_sync_fn_in_threadpool(self.fn, **kwargs)
+                result = await call_sync_fn_in_threadpool(
+                    type_adapter.validate_python, kwargs
+                )
                 # Handle sync wrappers that return awaitables (e.g., partial(async_fn))
                 if inspect.isawaitable(result):
                     result = await result
@@ -311,14 +363,10 @@ class FunctionPrompt(Prompt):
             return self.convert_result(result)
         except Exception as e:
             logger.exception(f"Error rendering prompt {self.name}")
-            raise PromptError(f"Error rendering prompt {self.name}.") from e
+            raise PromptError(f"Error rendering prompt {self.name!r}: {e}") from e
 
     def register_with_docket(self, docket: Docket) -> None:
-        """Register this prompt with docket for background execution.
-
-        FunctionPrompt registers the underlying function, which has the user's
-        Depends parameters for docket to resolve.
-        """
+        """Register this prompt with docket for background execution."""
         if not self.task_config.supports_tasks():
             return
         docket.register(self.fn, names=[self.key])
@@ -362,7 +410,7 @@ def prompt(
     tags: set[str] | None = None,
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
-    auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+    auth: AuthCheck | list[AuthCheck] | None = None,
 ) -> Callable[[F], F]: ...
 @overload
 def prompt(
@@ -376,7 +424,7 @@ def prompt(
     tags: set[str] | None = None,
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
-    auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+    auth: AuthCheck | list[AuthCheck] | None = None,
 ) -> Callable[[F], F]: ...
 
 
@@ -391,7 +439,7 @@ def prompt(
     tags: set[str] | None = None,
     meta: dict[str, Any] | None = None,
     task: bool | TaskConfig | None = None,
-    auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+    auth: AuthCheck | list[AuthCheck] | None = None,
 ) -> Any:
     """Standalone decorator to mark a function as an MCP prompt.
 
@@ -442,10 +490,10 @@ def prompt(
             warnings.warn(
                 "decorator_mode='object' is deprecated and will be removed in a future version. "
                 "Decorators now return the original function with metadata attached.",
-                DeprecationWarning,
+                FastMCPDeprecationWarning,
                 stacklevel=4,
             )
-            return create_prompt(fn, prompt_name)  # type: ignore[return-value]
+            return create_prompt(fn, prompt_name)  # type: ignore[return-value]  # ty:ignore[invalid-return-type]
         return attach_metadata(fn, prompt_name)
 
     if inspect.isroutine(name_or_fn):

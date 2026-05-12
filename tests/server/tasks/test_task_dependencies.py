@@ -13,6 +13,7 @@ import pytest
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.dependencies import CurrentDocket, CurrentFastMCP, Depends
+from fastmcp.exceptions import ToolError
 
 
 @pytest.fixture
@@ -67,7 +68,7 @@ async def dependency_server():
         return f"Resource via Docket: {docket is not None}"
 
     # Expose for test assertions
-    mcp._injected_values = injected_values  # type: ignore[attr-defined]
+    mcp._injected_values = injected_values  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
 
     return mcp
 
@@ -229,7 +230,7 @@ async def test_dependency_context_managers_cleaned_up_in_background():
             cleanup_called.append("exit")
 
     @mcp.tool(task=True)
-    async def use_connection(name: str, conn: str = Depends(tracked_connection)) -> str:  # type: ignore[assignment]
+    async def use_connection(name: str, conn: str = Depends(tracked_connection)) -> str:
         assert conn == "connection"
         assert "enter" in cleanup_called
         assert "exit" not in cleanup_called  # Still open during execution
@@ -256,8 +257,6 @@ async def test_dependency_errors_propagate_to_task_failure():
         value: str, dep: str = cast(Any, Depends(failing_dependency))
     ) -> str:
         return f"Got: {dep}"
-
-    from fastmcp.exceptions import ToolError
 
     async with Client(mcp) as client:
         task = await client.call_tool(

@@ -5,8 +5,6 @@ This module contains HTML generation functions for consent and error pages.
 
 from __future__ import annotations
 
-from urllib.parse import urlparse
-
 from fastmcp.utilities.ui import (
     BUTTON_STYLES,
     DETAIL_BOX_STYLES,
@@ -32,6 +30,8 @@ def create_consent_html(
     server_website_url: str | None = None,
     client_website_url: str | None = None,
     csp_policy: str | None = None,
+    is_cimd_client: bool = False,
+    cimd_domain: str | None = None,
 ) -> str:
     """Create a styled HTML consent page for OAuth authorization requests.
 
@@ -60,6 +60,17 @@ def create_consent_html(
         </div>
     """
 
+    # Build CIMD verified domain badge if applicable
+    cimd_badge = ""
+    if is_cimd_client and cimd_domain:
+        cimd_domain_escaped = html_module.escape(cimd_domain)
+        cimd_badge = f"""
+        <div class="cimd-badge">
+            <span class="cimd-check">&#x2713;</span>
+            Verified domain: <strong>{cimd_domain_escaped}</strong>
+        </div>
+        """
+
     # Build redirect URI section (yellow box, centered)
     redirect_uri_escaped = html_module.escape(redirect_uri)
     redirect_section = f"""
@@ -73,7 +84,7 @@ def create_consent_html(
     detail_rows = [
         ("Application Name", html_module.escape(client_name or client_id)),
         ("Application Website", html_module.escape(client_website_url or "N/A")),
-        ("Application ID", client_id),
+        ("Application ID", html_module.escape(client_id)),
         ("Redirect URI", redirect_uri_escaped),
         (
             "Requested Scopes",
@@ -144,6 +155,7 @@ def create_consent_html(
             {create_logo(icon_url=server_icon_url, alt_text=server_name or "FastMCP")}
             <h1>Application Access Request</h1>
             {intro_box}
+            {cimd_badge}
             {redirect_section}
             {advanced_details}
             {form}
@@ -152,6 +164,23 @@ def create_consent_html(
     """
 
     # Additional styles needed for this page
+    cimd_badge_styles = """
+        .cimd-badge {
+            background: #ecfdf5;
+            border: 1px solid #6ee7b7;
+            border-radius: 8px;
+            padding: 8px 16px;
+            margin-bottom: 16px;
+            font-size: 14px;
+            color: #065f46;
+            text-align: center;
+        }
+        .cimd-check {
+            color: #059669;
+            font-weight: bold;
+            margin-right: 4px;
+        }
+    """
     additional_styles = (
         INFO_BOX_STYLES
         + REDIRECT_SECTION_STYLES
@@ -159,6 +188,7 @@ def create_consent_html(
         + DETAIL_BOX_STYLES
         + BUTTON_STYLES
         + TOOLTIP_STYLES
+        + cimd_badge_styles
     )
 
     # Determine CSP policy to use
@@ -166,20 +196,13 @@ def create_consent_html(
     # If csp_policy is empty string, CSP will be disabled entirely in create_page
     # If csp_policy is a non-empty string, use it as-is
     if csp_policy is None:
-        # Need to allow form-action for form submission
-        # Chrome requires explicit scheme declarations in CSP form-action when redirect chains
-        # end in custom protocol schemes (e.g., cursor://). Parse redirect_uri to include its scheme.
-        parsed_redirect = urlparse(redirect_uri)
-        redirect_scheme = parsed_redirect.scheme.lower()
-
-        # Build form-action directive with standard schemes plus custom protocol if present
-        form_action_schemes = ["https:", "http:"]
-        if redirect_scheme and redirect_scheme not in ("http", "https"):
-            # Custom protocol scheme (e.g., cursor:, vscode:, etc.)
-            form_action_schemes.append(f"{redirect_scheme}:")
-
-        form_action_directive = " ".join(form_action_schemes)
-        csp_policy = f"default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; base-uri 'none'; form-action {form_action_directive}"
+        # The consent form posts to itself (action="") and all subsequent redirects
+        # are server-controlled. Chrome enforces form-action across the entire redirect
+        # chain (Chromium issue #40923007), which breaks flows where an HTTPS callback
+        # internally redirects to a custom scheme (e.g., claude:// or cursor://).
+        # Since the form target is same-origin and we control the redirect chain,
+        # omitting form-action is safe and avoids these browser-specific CSP issues.
+        csp_policy = "default-src 'none'; style-src 'unsafe-inline'; img-src https: data:; base-uri 'none'"
 
     return create_page(
         content=content,

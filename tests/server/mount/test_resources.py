@@ -54,6 +54,23 @@ class TestResourcesAndTemplates:
         assert profile["id"] == "123"
         assert profile["name"] == "User 123"
 
+    async def test_mount_with_wildcard_resource_template(self):
+        """Wildcard `{name*}` params must survive round-trip through a namespaced mount."""
+        main_app = FastMCP("MainApp")
+        sub_app = FastMCP("SubApp")
+
+        @sub_app.resource("resource://multi/{extra*}")
+        def multi(extra: str) -> str:
+            return extra
+
+        main_app.mount(sub_app, namespace="sub")
+
+        result = await main_app.read_resource("resource://sub/multi/abc/def")
+        assert result.contents[0].content == "abc/def"
+
+        result = await main_app.read_resource("resource://sub/multi/abc")
+        assert result.contents[0].content == "abc"
+
     async def test_adding_resource_after_mounting(self):
         """Test adding a resource after mounting."""
         main_app = FastMCP("MainApp")
@@ -134,3 +151,65 @@ class TestResourceUriPrefixing:
             t for t in templates if t.uri_template == "resource://prefix/user/{user_id}"
         )
         assert template.name == "user_template"
+
+
+class TestMountedResourceTemplateQueryParams:
+    """Test that resource templates with query params work on mounted servers."""
+
+    async def test_mounted_template_with_query_param(self):
+        """Query params in resource templates should work through mount."""
+        sub = FastMCP("Sub")
+
+        @sub.resource("resource://greet{?name}")
+        def greet(name: str = "World") -> str:
+            return f"Hello, {name}!"
+
+        main = FastMCP("Main")
+        main.mount(sub, "sub")
+
+        result = await main.read_resource("resource://sub/greet?name=Alice")
+        assert result.contents[0].content == "Hello, Alice!"
+
+    async def test_mounted_template_with_query_param_default(self):
+        """Missing query params should use defaults through mount."""
+        sub = FastMCP("Sub")
+
+        @sub.resource("resource://greet{?name}")
+        def greet(name: str = "World") -> str:
+            return f"Hello, {name}!"
+
+        main = FastMCP("Main")
+        main.mount(sub, "sub")
+
+        result = await main.read_resource("resource://sub/greet")
+        assert result.contents[0].content == "Hello, World!"
+
+    async def test_mounted_template_with_multiple_query_params(self):
+        """Multiple query params should all pass through mount correctly."""
+        sub = FastMCP("Sub")
+
+        @sub.resource("resource://data/{id}{?format,verbose}")
+        def get_data(id: str, format: str = "json", verbose: bool = False) -> str:
+            return f"id={id} format={format} verbose={verbose}"
+
+        main = FastMCP("Main")
+        main.mount(sub, "api")
+
+        result = await main.read_resource(
+            "resource://api/data/42?format=xml&verbose=true"
+        )
+        assert result.contents[0].content == "id=42 format=xml verbose=True"
+
+    async def test_mounted_template_with_partial_query_params(self):
+        """Providing only some query params should use defaults for the rest."""
+        sub = FastMCP("Sub")
+
+        @sub.resource("resource://data/{id}{?format,limit}")
+        def get_data(id: str, format: str = "json", limit: int = 10) -> str:
+            return f"id={id} format={format} limit={limit}"
+
+        main = FastMCP("Main")
+        main.mount(sub, "api")
+
+        result = await main.read_resource("resource://api/data/42?limit=5")
+        assert result.contents[0].content == "id=42 format=json limit=5"

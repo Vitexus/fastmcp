@@ -26,10 +26,10 @@ from typing import TYPE_CHECKING, Protocol
 from fastmcp.utilities.versions import VersionSpec
 
 if TYPE_CHECKING:
-    from fastmcp.prompts.prompt import Prompt
-    from fastmcp.resources.resource import Resource
+    from fastmcp.prompts.base import Prompt
+    from fastmcp.resources.base import Resource
     from fastmcp.resources.template import ResourceTemplate
-    from fastmcp.tools.tool import Tool
+    from fastmcp.tools.base import Tool
 
 
 # Get methods use Protocol to express keyword-only version parameter
@@ -228,10 +228,6 @@ from fastmcp.server.transforms.tool_transform import ToolTransform  # noqa: E402
 from fastmcp.server.transforms.version_filter import VersionFilter  # noqa: E402
 
 __all__ = [
-    "GetPromptNext",
-    "GetResourceNext",
-    "GetResourceTemplateNext",
-    "GetToolNext",
     "Namespace",
     "PromptsAsTools",
     "ResourcesAsTools",

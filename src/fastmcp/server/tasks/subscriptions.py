@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING
 from docket.execution import ExecutionState
 from mcp.types import TaskStatusNotification, TaskStatusNotificationParams
 
-from fastmcp.server.tasks.keys import parse_task_key
+from fastmcp.server.tasks.config import DEFAULT_TTL_MS
+from fastmcp.server.tasks.keys import parse_task_key, task_redis_prefix
 from fastmcp.server.tasks.requests import DOCKET_TO_MCP_STATE
 from fastmcp.utilities.logging import get_logger
 
@@ -54,17 +55,26 @@ async def subscribe_to_task_updates(
             return
 
         # Subscribe to state and progress events from Docket
+        terminal_states = {
+            ExecutionState.COMPLETED,
+            ExecutionState.FAILED,
+            ExecutionState.CANCELLED,
+        }
         async for event in execution.subscribe():
             if event["type"] == "state":
+                state = ExecutionState(event["state"])
                 # Send notifications/tasks/status when state changes
                 await _send_status_notification(
                     session=session,
                     task_id=task_id,
                     task_key=task_key,
                     docket=docket,
-                    state=ExecutionState(event["state"]),
+                    state=state,
                     poll_interval_ms=poll_interval_ms,
                 )
+                # Stop subscribing once the task reaches a terminal state
+                if state in terminal_states:
+                    break
             elif event["type"] == "progress":
                 # Send notification when progress message changes
                 await _send_progress_notification(
@@ -105,11 +115,11 @@ async def _send_status_notification(
     state_map = DOCKET_TO_MCP_STATE
     mcp_status = state_map.get(state, "failed")
 
-    # Extract session_id from task_key for Redis lookup
+    # Extract task_scope from task_key for Redis lookup
     key_parts = parse_task_key(task_key)
-    session_id = key_parts["session_id"]
+    task_scope = key_parts["task_scope"]
 
-    created_at_key = docket.key(f"fastmcp:task:{session_id}:{task_id}:created_at")
+    created_at_key = docket.key(f"{task_redis_prefix(task_scope)}:{task_id}:created_at")
     async with docket.redis() as redis:
         created_at_bytes = await redis.get(created_at_key)
 
@@ -133,7 +143,7 @@ async def _send_status_notification(
         "status": mcp_status,
         "createdAt": created_at,
         "lastUpdatedAt": datetime.now(timezone.utc).isoformat(),
-        "ttl": 60000,
+        "ttl": DEFAULT_TTL_MS,
         "pollInterval": poll_interval_ms,
     }
 
@@ -147,7 +157,7 @@ async def _send_status_notification(
 
     # Send notification (don't let failures break the subscription)
     with suppress(Exception):
-        await session.send_notification(notification)  # type: ignore[arg-type]
+        await session.send_notification(notification)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
 
 
 async def _send_progress_notification(
@@ -179,11 +189,11 @@ async def _send_progress_notification(
     state_map = DOCKET_TO_MCP_STATE
     mcp_status = state_map.get(execution.state, "failed")
 
-    # Extract session_id from task_key for Redis lookup
+    # Extract task_scope from task_key for Redis lookup
     key_parts = parse_task_key(task_key)
-    session_id = key_parts["session_id"]
+    task_scope = key_parts["task_scope"]
 
-    created_at_key = docket.key(f"fastmcp:task:{session_id}:{task_id}:created_at")
+    created_at_key = docket.key(f"{task_redis_prefix(task_scope)}:{task_id}:created_at")
     async with docket.redis() as redis:
         created_at_bytes = await redis.get(created_at_key)
 
@@ -198,7 +208,7 @@ async def _send_progress_notification(
         "status": mcp_status,
         "createdAt": created_at,
         "lastUpdatedAt": datetime.now(timezone.utc).isoformat(),
-        "ttl": 60000,
+        "ttl": DEFAULT_TTL_MS,
         "pollInterval": poll_interval_ms,
         "statusMessage": execution.progress.message,
     }
@@ -209,4 +219,4 @@ async def _send_progress_notification(
     )
 
     with suppress(Exception):
-        await session.send_notification(notification)  # type: ignore[arg-type]
+        await session.send_notification(notification)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]

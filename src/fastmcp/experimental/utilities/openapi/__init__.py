@@ -2,6 +2,8 @@
 
 import warnings
 
+from fastmcp.exceptions import FastMCPDeprecationWarning
+
 from fastmcp.utilities.openapi import (
     HTTPRoute,
     HttpMethod,
@@ -10,7 +12,6 @@ from fastmcp.utilities.openapi import (
     RequestBodyInfo,
     ResponseInfo,
     extract_output_schema_from_responses,
-    format_simple_description,
     parse_openapi_to_http_routes,
     _combine_schemas,
 )
@@ -19,7 +20,7 @@ from fastmcp.utilities.openapi import (
 warnings.warn(
     "Importing from fastmcp.experimental.utilities.openapi is deprecated. "
     "Import from fastmcp.utilities.openapi instead.",
-    DeprecationWarning,
+    FastMCPDeprecationWarning,
     stacklevel=2,
 )
 
@@ -32,6 +33,5 @@ __all__ = [
     "ResponseInfo",
     "_combine_schemas",
     "extract_output_schema_from_responses",
-    "format_simple_description",
     "parse_openapi_to_http_routes",
 ]

@@ -6,6 +6,59 @@ import pytest
 from fastmcp import FastMCP
 from fastmcp.client import Client
 from fastmcp.server.providers.openapi import OpenAPIProvider
+from fastmcp.server.providers.openapi.provider import DEFAULT_TIMEOUT
+
+
+class TestOpenAPIProviderServerVariables:
+    """Test that OpenAPIProvider resolves OpenAPI 3.x server variables."""
+
+    def test_server_variables_substituted_with_defaults(self):
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "Test API", "version": "1.0.0"},
+            "servers": [
+                {
+                    "url": "https://{region}.api.example.com/v1",
+                    "variables": {
+                        "region": {
+                            "default": "us",
+                            "enum": ["us", "eu", "apac"],
+                        }
+                    },
+                }
+            ],
+            "paths": {},
+        }
+        client = OpenAPIProvider._create_default_client(spec)
+        assert str(client.base_url) == "https://us.api.example.com/v1/"
+
+    def test_multiple_server_variables_substituted(self):
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "Test API", "version": "1.0.0"},
+            "servers": [
+                {
+                    "url": "{scheme}://{host}/v1",
+                    "variables": {
+                        "scheme": {"default": "https"},
+                        "host": {"default": "api.example.com"},
+                    },
+                }
+            ],
+            "paths": {},
+        }
+        client = OpenAPIProvider._create_default_client(spec)
+        assert str(client.base_url) == "https://api.example.com/v1/"
+
+    def test_static_server_url_unaffected(self):
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "Test API", "version": "1.0.0"},
+            "servers": [{"url": "https://api.example.com"}],
+            "paths": {},
+        }
+        client = OpenAPIProvider._create_default_client(spec)
+        assert str(client.base_url) == "https://api.example.com"
 
 
 class TestOpenAPIProviderBasicFunctionality:
@@ -146,16 +199,21 @@ class TestOpenAPIProviderBasicFunctionality:
             assert get_user_tool is not None
             assert get_user_tool.description is not None
 
-    def test_provider_with_timeout(self, simple_openapi_spec):
-        """Test provider initialization with timeout setting."""
-        client = httpx.AsyncClient(base_url="https://api.example.com")
-        provider = OpenAPIProvider(
-            openapi_spec=simple_openapi_spec,
-            client=client,
-            timeout=30.0,
-        )
+    def test_provider_creates_default_client_from_spec(self, simple_openapi_spec):
+        """Test that omitting client creates one from the spec's servers URL."""
+        provider = OpenAPIProvider(openapi_spec=simple_openapi_spec)
+        assert str(provider._client.base_url).rstrip("/") == "https://api.example.com"
+        assert provider._client.timeout == httpx.Timeout(DEFAULT_TIMEOUT)
 
-        assert provider._timeout == 30.0
+    def test_provider_default_client_requires_servers(self):
+        """Test that omitting client without servers in spec raises."""
+        spec = {
+            "openapi": "3.0.0",
+            "info": {"title": "No Servers", "version": "1.0.0"},
+            "paths": {},
+        }
+        with pytest.raises(ValueError, match="No server URL"):
+            OpenAPIProvider(openapi_spec=spec)
 
     def test_provider_with_empty_spec(self):
         """Test provider with minimal OpenAPI spec."""

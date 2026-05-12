@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 from urllib.parse import urlparse
 
 from mcp.server.auth.handlers.token import TokenErrorResponse
@@ -9,7 +9,13 @@ from mcp.server.auth.handlers.token import TokenHandler as _SDKTokenHandler
 from mcp.server.auth.json_response import PydanticJSONResponse
 from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.auth.middleware.bearer_auth import BearerAuthBackend
-from mcp.server.auth.middleware.client_auth import ClientAuthenticator
+from mcp.server.auth.middleware.client_auth import (
+    AuthenticationError,
+    ClientAuthenticator,
+)
+from mcp.server.auth.middleware.client_auth import (
+    ClientAuthenticator as _SDKClientAuthenticator,
+)
 from mcp.server.auth.provider import (
     AccessToken as _SDKAccessToken,
 )
@@ -30,12 +36,17 @@ from mcp.server.auth.settings import (
     ClientRegistrationOptions,
     RevocationOptions,
 )
+from mcp.shared.auth import OAuthClientInformationFull
 from pydantic import AnyHttpUrl, Field
 from starlette.middleware import Middleware
 from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.requests import Request
 from starlette.routing import Route
 
 from fastmcp.utilities.logging import get_logger
+
+if TYPE_CHECKING:
+    from fastmcp.server.auth.cimd import CIMDClientManager
 
 logger = get_logger(__name__)
 
@@ -108,6 +119,91 @@ class TokenHandler(_SDKTokenHandler):
         return response
 
 
+# Expected assertion type for private_key_jwt
+JWT_BEARER_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
+
+
+class PrivateKeyJWTClientAuthenticator(_SDKClientAuthenticator):
+    """Client authenticator with private_key_jwt support for CIMD clients.
+
+    Extends the SDK's ClientAuthenticator to add support for the `private_key_jwt`
+    authentication method per RFC 7523. This is required for CIMD (Client ID Metadata
+    Document) clients that use asymmetric keys for authentication.
+
+    The authenticator:
+    1. Delegates to SDK for standard methods (client_secret_basic, client_secret_post, none)
+    2. Adds private_key_jwt handling for CIMD clients
+    3. Validates JWT assertions against client's JWKS
+    """
+
+    def __init__(
+        self,
+        provider: OAuthAuthorizationServerProvider[Any, Any, Any],
+        cimd_manager: CIMDClientManager,
+        token_endpoint_url: str,
+    ):
+        """Initialize the authenticator.
+
+        Args:
+            provider: OAuth provider for client lookups
+            cimd_manager: CIMD manager for private_key_jwt validation
+            token_endpoint_url: Token endpoint URL for audience validation
+        """
+        super().__init__(provider)
+        self._cimd_manager = cimd_manager
+        self._token_endpoint_url = token_endpoint_url
+
+    async def authenticate_request(
+        self, request: Request
+    ) -> OAuthClientInformationFull:
+        """Authenticate a client from an HTTP request.
+
+        Extends SDK authentication to support private_key_jwt for CIMD clients.
+        Delegates to SDK for client_secret_basic (Authorization header) and
+        client_secret_post (form body) authentication.
+        """
+        form_data = await request.form()
+        client_id = form_data.get("client_id")
+
+        # If client_id is not in form data, delegate to SDK
+        # This handles client_secret_basic which sends credentials in Authorization header
+        if not client_id:
+            return await super().authenticate_request(request)
+
+        client = await self.provider.get_client(str(client_id))
+        if not client:
+            raise AuthenticationError("Invalid client_id")
+
+        # Handle private_key_jwt authentication for CIMD clients
+        if client.token_endpoint_auth_method == "private_key_jwt":
+            # Validate assertion parameters
+            assertion_type = form_data.get("client_assertion_type")
+            assertion = form_data.get("client_assertion")
+
+            if assertion_type != JWT_BEARER_ASSERTION_TYPE:
+                raise AuthenticationError(
+                    f"Invalid client_assertion_type: expected {JWT_BEARER_ASSERTION_TYPE}"
+                )
+
+            if not assertion or not isinstance(assertion, str):
+                raise AuthenticationError("Missing client_assertion")
+
+            # Validate the JWT assertion using CIMD manager
+            try:
+                await self._cimd_manager.validate_private_key_jwt(
+                    assertion=assertion,
+                    client=client,
+                    token_endpoint=self._token_endpoint_url,
+                )
+            except ValueError as e:
+                raise AuthenticationError(f"Invalid client assertion: {e}") from e
+
+            return client
+
+        # Delegate to SDK for other authentication methods
+        return await super().authenticate_request(request)
+
+
 class AuthProvider(TokenVerifierProtocol):
     """Base class for all FastMCP authentication providers.
 
@@ -121,6 +217,7 @@ class AuthProvider(TokenVerifierProtocol):
         self,
         base_url: AnyHttpUrl | str | None = None,
         required_scopes: list[str] | None = None,
+        resource_base_url: AnyHttpUrl | str | None = None,
     ):
         """
         Initialize the auth provider.
@@ -128,11 +225,21 @@ class AuthProvider(TokenVerifierProtocol):
         Args:
             base_url: The base URL of this server (e.g., http://localhost:8000).
                 This is used for constructing .well-known endpoints and OAuth metadata.
+            resource_base_url: Optional public base URL for the protected resource.
+                When provided, the resource URL advertised in protected resource
+                metadata (RFC 9728) is derived from this URL instead of ``base_url``,
+                while operational OAuth routes remain rooted at ``base_url``.
+                Providers that mint their own downstream tokens (e.g. ``OAuthProxy``)
+                also use this as the minted token audience. Upstream token audience
+                validation is configured separately on the token verifier.
             required_scopes: List of OAuth scopes required for all requests.
         """
         if isinstance(base_url, str):
             base_url = AnyHttpUrl(base_url)
+        if isinstance(resource_base_url, str):
+            resource_base_url = AnyHttpUrl(resource_base_url)
         self.base_url = base_url
+        self.resource_base_url = resource_base_url
         self.required_scopes = required_scopes or []
         self._mcp_path: str | None = None
         self._resource_url: AnyHttpUrl | None = None
@@ -225,7 +332,6 @@ class AuthProvider(TokenVerifierProtocol):
         Returns:
             List of Starlette Middleware instances to apply to the HTTP app
         """
-        # TODO(ty): remove type ignores when ty supports Starlette Middleware typing
         return [
             Middleware(
                 AuthenticationMiddleware,  # type: ignore[arg-type]
@@ -237,20 +343,24 @@ class AuthProvider(TokenVerifierProtocol):
     def _get_resource_url(self, path: str | None = None) -> AnyHttpUrl | None:
         """Get the actual resource URL being protected.
 
+        Uses ``resource_base_url`` if set; otherwise falls back to
+        ``base_url``.
+
         Args:
             path: The path where the resource endpoint is mounted (e.g., "/mcp")
 
         Returns:
             The full URL of the protected resource
         """
-        if self.base_url is None:
+        resource_base_url = self.resource_base_url or self.base_url
+        if resource_base_url is None:
             return None
 
         if path:
-            prefix = str(self.base_url).rstrip("/")
+            prefix = str(resource_base_url).rstrip("/")
             suffix = path.lstrip("/")
             return AnyHttpUrl(f"{prefix}/{suffix}")
-        return self.base_url
+        return resource_base_url
 
 
 class TokenVerifier(AuthProvider):
@@ -264,15 +374,36 @@ class TokenVerifier(AuthProvider):
         self,
         base_url: AnyHttpUrl | str | None = None,
         required_scopes: list[str] | None = None,
+        resource_base_url: AnyHttpUrl | str | None = None,
     ):
         """
         Initialize the token verifier.
 
         Args:
             base_url: The base URL of this server
+            resource_base_url: Optional public base URL for the protected resource.
+                When provided, the resource URL advertised in protected resource
+                metadata is derived from this URL instead of ``base_url``. Does not
+                configure upstream token audience validation — set ``audience`` on
+                your verifier to match.
             required_scopes: Scopes that are required for all requests
         """
-        super().__init__(base_url=base_url, required_scopes=required_scopes)
+        super().__init__(
+            base_url=base_url,
+            resource_base_url=resource_base_url,
+            required_scopes=required_scopes,
+        )
+
+    @property
+    def scopes_supported(self) -> list[str]:
+        """Scopes to advertise in OAuth metadata.
+
+        Defaults to required_scopes. Override in subclasses when the
+        advertised scopes differ from the validation scopes (e.g., Azure AD
+        where tokens contain short-form scopes but clients request full URI
+        scopes).
+        """
+        return self.required_scopes or []
 
     async def verify_token(self, token: str) -> AccessToken | None:
         """Verify a bearer token and return access info if valid."""
@@ -299,6 +430,8 @@ class RemoteAuthProvider(AuthProvider):
         token_verifier: TokenVerifier,
         authorization_servers: list[AnyHttpUrl],
         base_url: AnyHttpUrl | str,
+        scopes_supported: list[str] | None = None,
+        resource_base_url: AnyHttpUrl | str | None = None,
         resource_name: str | None = None,
         resource_documentation: AnyHttpUrl | None = None,
     ):
@@ -308,15 +441,27 @@ class RemoteAuthProvider(AuthProvider):
             token_verifier: TokenVerifier instance for token validation
             authorization_servers: List of authorization servers that issue valid tokens
             base_url: The base URL of this server
+            resource_base_url: Optional public base URL for the protected resource.
+                When provided, the resource URL advertised in protected resource
+                metadata is derived from this URL instead of ``base_url``. Does not
+                configure the token verifier's audience — set ``audience`` on the
+                verifier to match if you want validated tokens bound to the same
+                resource.
+            scopes_supported: Scopes to advertise in OAuth metadata. If None,
+                uses the token verifier's scopes_supported property. Use this
+                when the scopes clients request differ from the scopes that
+                appear in tokens (e.g., Azure AD full URI scopes vs short-form).
             resource_name: Optional name for the protected resource
             resource_documentation: Optional documentation URL for the protected resource
         """
         super().__init__(
             base_url=base_url,
+            resource_base_url=resource_base_url,
             required_scopes=token_verifier.required_scopes,
         )
         self.token_verifier = token_verifier
         self.authorization_servers = authorization_servers
+        self._scopes_supported = scopes_supported
         self.resource_name = resource_name
         self.resource_documentation = resource_documentation
 
@@ -332,6 +477,12 @@ class RemoteAuthProvider(AuthProvider):
 
         Creates protected resource metadata routes (RFC 9728).
         """
+        # Lifecycle hook: let subclasses react to the mcp_path becoming known
+        # (e.g., bind token audience to the resource URL). Mirrors the call in
+        # OAuthAuthorizationServerProvider.get_routes so all providers see the
+        # path at the same point in their lifecycle.
+        self.set_mcp_path(mcp_path)
+
         routes = []
 
         # Get the resource URL based on the MCP path
@@ -343,13 +494,144 @@ class RemoteAuthProvider(AuthProvider):
                 create_protected_resource_routes(
                     resource_url=resource_url,
                     authorization_servers=self.authorization_servers,
-                    scopes_supported=self.token_verifier.required_scopes,
+                    scopes_supported=(
+                        self._scopes_supported
+                        if self._scopes_supported is not None
+                        else self.token_verifier.scopes_supported
+                    ),
                     resource_name=self.resource_name,
                     resource_documentation=self.resource_documentation,
                 )
             )
 
         return routes
+
+
+class MultiAuth(AuthProvider):
+    """Composes an optional auth server with additional token verifiers.
+
+    Use this when a single server needs to accept tokens from multiple sources.
+    For example, an OAuth proxy for interactive clients combined with a JWT
+    verifier for machine-to-machine tokens.
+
+    Token verification tries the server first (if present), then each verifier
+    in order, returning the first successful result. Routes and OAuth metadata
+    come from the server; verifiers contribute only token verification.
+
+    Example:
+        ```python
+        from fastmcp.server.auth import MultiAuth, JWTVerifier, OAuthProxy
+
+        auth = MultiAuth(
+            server=OAuthProxy(issuer_url="https://login.example.com/..."),
+            verifiers=[JWTVerifier(jwks_uri="https://example.com/.well-known/jwks.json")],
+        )
+        mcp = FastMCP("my-server", auth=auth)
+        ```
+    """
+
+    def __init__(
+        self,
+        *,
+        server: AuthProvider | None = None,
+        verifiers: list[TokenVerifier] | TokenVerifier | None = None,
+        base_url: AnyHttpUrl | str | None = None,
+        resource_base_url: AnyHttpUrl | str | None = None,
+        required_scopes: list[str] | None = None,
+    ):
+        """Initialize the multi-auth provider.
+
+        Args:
+            server: Optional auth provider (e.g., OAuthProxy) that owns routes
+                and OAuth metadata. Also participates in token verification as
+                the first verifier tried.
+            verifiers: One or more token verifiers to try after the server.
+            base_url: Override the base URL. Defaults to the server's base_url.
+            resource_base_url: Override the protected resource base URL. Defaults
+                to the server's resource_base_url when available.
+            required_scopes: Override required scopes. Defaults to the server's.
+        """
+        if verifiers is None:
+            verifiers = []
+        elif isinstance(verifiers, TokenVerifier):
+            verifiers = [verifiers]
+
+        if server is None and not verifiers:
+            raise ValueError("MultiAuth requires at least a server or one verifier")
+
+        effective_base_url = base_url or (server.base_url if server else None)
+        effective_resource_base_url = resource_base_url or (
+            server.resource_base_url if server else None
+        )
+        effective_scopes = (
+            required_scopes
+            if required_scopes is not None
+            else (server.required_scopes if server else None)
+        )
+
+        super().__init__(
+            base_url=effective_base_url,
+            resource_base_url=effective_resource_base_url,
+            required_scopes=effective_scopes,
+        )
+        self.server = server
+        self.verifiers = list(verifiers)
+
+        # If an explicit resource_base_url override was passed to MultiAuth,
+        # propagate it to the wrapped server so its routes advertise metadata
+        # consistent with the outer auth challenge URL.
+        if resource_base_url is not None and self.server is not None:
+            self.server.resource_base_url = self.resource_base_url
+
+        self._sources: list[AuthProvider] = []
+        if self.server is not None:
+            self._sources.append(self.server)
+        self._sources.extend(self.verifiers)
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        """Verify a token by trying the server, then each verifier in order.
+
+        Each source is tried independently. If a source raises an exception,
+        it is logged and treated as a non-match so that remaining sources
+        still get a chance to verify the token.
+        """
+        for source in self._sources:
+            try:
+                result = await source.verify_token(token)
+                if result is not None:
+                    return result
+            except Exception:
+                logger.debug(
+                    "Token verification failed for %s, trying next source",
+                    type(source).__name__,
+                    exc_info=True,
+                )
+
+        return None
+
+    def set_mcp_path(self, mcp_path: str | None) -> None:
+        """Propagate MCP path to the server and all verifiers."""
+        super().set_mcp_path(mcp_path)
+        if self.server is not None:
+            self.server.set_mcp_path(mcp_path)
+        for verifier in self.verifiers:
+            verifier.set_mcp_path(mcp_path)
+
+    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        """Delegate route creation to the server."""
+        if self.server is not None:
+            return self.server.get_routes(mcp_path)
+        return []
+
+    def get_well_known_routes(self, mcp_path: str | None = None) -> list[Route]:
+        """Delegate well-known route creation to the server.
+
+        This ensures that server-specific well-known route logic (e.g.,
+        OAuthProvider's RFC 8414 path-aware discovery) is preserved.
+        """
+        if self.server is not None:
+            return self.server.get_well_known_routes(mcp_path)
+        return []
 
 
 class OAuthProvider(
@@ -366,6 +648,7 @@ class OAuthProvider(
         self,
         *,
         base_url: AnyHttpUrl | str,
+        resource_base_url: AnyHttpUrl | str | None = None,
         issuer_url: AnyHttpUrl | str | None = None,
         service_documentation_url: AnyHttpUrl | str | None = None,
         client_registration_options: ClientRegistrationOptions | None = None,
@@ -377,6 +660,9 @@ class OAuthProvider(
 
         Args:
             base_url: The public URL of this FastMCP server
+            resource_base_url: Optional public base URL for the protected resource.
+                When provided, the protected resource metadata and token audience are
+                derived from this URL instead of ``base_url``.
             issuer_url: The issuer URL for OAuth metadata (defaults to base_url)
             service_documentation_url: The URL of the service documentation.
             client_registration_options: The client registration options.
@@ -384,7 +670,11 @@ class OAuthProvider(
             required_scopes: Scopes that are required for all requests.
         """
 
-        super().__init__(base_url=base_url, required_scopes=required_scopes)
+        super().__init__(
+            base_url=base_url,
+            resource_base_url=resource_base_url,
+            required_scopes=required_scopes,
+        )
 
         if issuer_url is None:
             self.issuer_url = self.base_url

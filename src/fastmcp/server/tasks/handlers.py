@@ -14,15 +14,27 @@ import mcp.types
 from mcp.shared.exceptions import McpError
 from mcp.types import INTERNAL_ERROR, ErrorData
 
-from fastmcp.server.dependencies import _current_docket, get_context
+from fastmcp.server.dependencies import (
+    _current_docket,
+    get_context,
+)
 from fastmcp.server.tasks.config import TaskMeta
-from fastmcp.server.tasks.keys import build_task_key
+from fastmcp.server.tasks.context import (
+    TaskContextSnapshot,
+    get_task_scope,
+    register_task_server,
+    register_task_session,
+)
+from fastmcp.server.tasks.keys import build_task_key, task_redis_prefix
+from fastmcp.utilities.logging import get_logger
 
 if TYPE_CHECKING:
-    from fastmcp.prompts.prompt import Prompt
-    from fastmcp.resources.resource import Resource
+    from fastmcp.prompts.base import Prompt
+    from fastmcp.resources.base import Resource
     from fastmcp.resources.template import ResourceTemplate
-    from fastmcp.tools.tool import Tool
+    from fastmcp.tools.base import Tool
+
+logger = get_logger(__name__)
 
 # Redis mapping TTL buffer: Add 15 minutes to Docket's execution_ttl
 TASK_MAPPING_TTL_BUFFER_SECONDS = 15 * 60
@@ -61,14 +73,20 @@ async def submit_to_docket(
     # Record creation timestamp per SEP-1686 final spec (line 430)
     created_at = datetime.now(timezone.utc)
 
-    # Get session ID - use "internal" for programmatic calls without MCP session
     ctx = get_context()
+
+    # Authorization scope for task isolation (auth identity, or None for anonymous)
+    task_scope = get_task_scope()
+
+    # Transport session ID for notification delivery
     try:
         session_id = ctx.session_id
     except RuntimeError:
-        session_id = "internal"
+        session_id = None
 
-    docket = _current_docket.get()
+    # Try the server's own Docket first; fall back to the ContextVar for
+    # mounted children (whose parent server owns the Docket instance).
+    docket = ctx.fastmcp._docket or _current_docket.get()
     if docket is None:
         raise McpError(
             ErrorData(
@@ -77,8 +95,14 @@ async def submit_to_docket(
             )
         )
 
+    # Register the current server so background workers resolve
+    # CurrentFastMCP() / ctx.fastmcp to the correct (child) server
+    # for mounted tasks. At this point ctx.fastmcp is the child because
+    # we're inside the child's call_tool dispatch.
+    register_task_server(server_task_id, ctx.fastmcp)
+
     # Build full task key with embedded metadata
-    task_key = build_task_key(session_id, server_task_id, task_type, key)
+    task_key = build_task_key(task_scope, server_task_id, task_type, key)
 
     # Determine TTL: use task_meta.ttl if provided, else docket default
     if task_meta is not None and task_meta.ttl is not None:
@@ -88,53 +112,74 @@ async def submit_to_docket(
     ttl_seconds = int(ttl_ms / 1000) + TASK_MAPPING_TTL_BUFFER_SECONDS
 
     # Store task metadata in Redis for protocol handlers
-    task_meta_key = docket.key(f"fastmcp:task:{session_id}:{server_task_id}")
-    created_at_key = docket.key(
-        f"fastmcp:task:{session_id}:{server_task_id}:created_at"
-    )
-    poll_interval_key = docket.key(
-        f"fastmcp:task:{session_id}:{server_task_id}:poll_interval"
-    )
+    prefix = task_redis_prefix(task_scope)
+    task_meta_key = docket.key(f"{prefix}:{server_task_id}")
+    created_at_key = docket.key(f"{prefix}:{server_task_id}:created_at")
+    poll_interval_key = docket.key(f"{prefix}:{server_task_id}:poll_interval")
     poll_interval_ms = int(component.task_config.poll_interval.total_seconds() * 1000)
+
+    # Snapshot all context (access token, headers, origin request ID,
+    # and session_id for notification delivery in background workers)
+    snapshot = TaskContextSnapshot.capture()
+
     async with docket.redis() as redis:
         await redis.set(task_meta_key, task_key, ex=ttl_seconds)
         await redis.set(created_at_key, created_at.isoformat(), ex=ttl_seconds)
         await redis.set(poll_interval_key, str(poll_interval_ms), ex=ttl_seconds)
 
-    # Send notifications/tasks/created per SEP-1686 (mandatory)
-    # Send BEFORE queuing to avoid race where task completes before notification
-    notification = mcp.types.JSONRPCNotification(
-        jsonrpc="2.0",
-        method="notifications/tasks/created",
-        params={},  # Empty params per spec
-        _meta={  # type: ignore[call-arg]  # _meta is Pydantic alias for meta field
-            "modelcontextprotocol.io/related-task": {
+    await snapshot.save(docket, task_scope, server_task_id, ttl_seconds)
+
+    # Register session for Context access in background workers (SEP-1686)
+    # This enables elicitation/sampling from background tasks via weakref
+    # Skip when there is no session (programmatic calls without MCP session)
+    if session_id is not None:
+        register_task_session(session_id, ctx.session)
+
+    # Send an initial tasks/status notification before queueing.
+    # This guarantees clients can observe task creation immediately.
+    notification = mcp.types.TaskStatusNotification.model_validate(
+        {
+            "method": "notifications/tasks/status",
+            "params": {
                 "taskId": server_task_id,
-            }
-        },
+                "status": "working",
+                "statusMessage": "Task submitted",
+                "createdAt": created_at,
+                "lastUpdatedAt": created_at,
+                "ttl": ttl_ms,
+                "pollInterval": poll_interval_ms,
+            },
+            "_meta": {
+                "io.modelcontextprotocol/related-task": {
+                    "taskId": server_task_id,
+                }
+            },
+        }
     )
+    server_notification = mcp.types.ServerNotification(notification)
     with suppress(Exception):
         # Don't let notification failures break task creation
-        await ctx.session.send_notification(notification)  # type: ignore[arg-type]
+        await ctx.session.send_notification(server_notification)
 
     # Queue function to Docket by key (result storage via execution_ttl)
     # Use component.add_to_docket() which handles calling conventions
     # `fn_key` is the function lookup key (e.g., "child_multiply")
-    # `task_key` is the task result key (e.g., "fastmcp:task:{session}:{task_id}:tool:child_multiply")
+    # `task_key` is the task result key (e.g., "fastmcp:task:{task_scope}:{task_id}:tool:child_multiply")
     # Resources don't take arguments; tools/prompts/templates always pass arguments (even if None/empty)
     if task_type == "resource":
-        await component.add_to_docket(docket, fn_key=key, task_key=task_key)  # type: ignore[call-arg]
+        await component.add_to_docket(docket, fn_key=key, task_key=task_key)  # type: ignore[call-arg]  # ty:ignore[missing-argument]
     else:
-        await component.add_to_docket(docket, arguments, fn_key=key, task_key=task_key)  # type: ignore[call-arg]
+        await component.add_to_docket(docket, arguments, fn_key=key, task_key=task_key)  # type: ignore[call-arg]  # ty:ignore[invalid-argument-type, too-many-positional-arguments]
 
     # Spawn subscription task to send status notifications (SEP-1686 optional feature)
+    # Start subscription in session's task group (persists for connection lifetime)
+    # Deferred: subscriptions and notifications depend on docket at import time
     from fastmcp.server.tasks.subscriptions import subscribe_to_task_updates
 
-    # Start subscription in session's task group (persists for connection lifetime)
     if hasattr(ctx.session, "_subscription_task_group"):
         tg = ctx.session._subscription_task_group
         if tg:
-            tg.start_soon(  # type: ignore[union-attr]
+            tg.start_soon(  # type: ignore[union-attr]  # ty:ignore[unresolved-attribute]
                 subscribe_to_task_updates,
                 server_task_id,
                 task_key,
@@ -142,6 +187,35 @@ async def submit_to_docket(
                 docket,
                 poll_interval_ms,
             )
+
+    # Deferred: notifications depends on docket at import time
+    from fastmcp.server.tasks.notifications import (
+        ensure_subscriber_running,
+        stop_subscriber,
+    )
+
+    if session_id is not None:
+        try:
+            await ensure_subscriber_running(
+                session_id, ctx.session, docket, ctx.fastmcp
+            )
+
+            # Register cleanup callback on session exit (once per session)
+            # This ensures subscriber is stopped when the session disconnects
+            if (
+                hasattr(ctx.session, "_exit_stack")
+                and ctx.session._exit_stack is not None
+                and not getattr(ctx.session, "_notification_cleanup_registered", False)
+            ):
+
+                async def _cleanup_subscriber() -> None:
+                    await stop_subscriber(session_id)  # type: ignore[arg-type]
+
+                ctx.session._exit_stack.push_async_callback(_cleanup_subscriber)
+                ctx.session._notification_cleanup_registered = True  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
+        except Exception as e:
+            # Non-fatal: elicitation will still work via polling fallback
+            logger.debug("Failed to start notification subscriber: %s", e)
 
     # Return CreateTaskResult with proper Task object
     # Tasks MUST begin in "working" status per SEP-1686 final spec (line 381)

@@ -21,6 +21,8 @@ Example:
     ```
 """
 
+from typing import Literal
+
 from key_value.aio.protocols import AsyncKeyValue
 from pydantic import AnyHttpUrl
 
@@ -63,13 +65,16 @@ class Auth0Provider(OIDCProxy):
         client_secret: str,
         audience: str,
         base_url: AnyHttpUrl | str,
+        resource_base_url: AnyHttpUrl | str | None = None,
         issuer_url: AnyHttpUrl | str | None = None,
         required_scopes: list[str] | None = None,
         redirect_path: str | None = None,
         allowed_client_redirect_uris: list[str] | None = None,
         client_storage: AsyncKeyValue | None = None,
         jwt_signing_key: str | bytes | None = None,
-        require_authorization_consent: bool = True,
+        require_authorization_consent: bool | Literal["external"] = True,
+        consent_csp_policy: str | None = None,
+        forward_resource: bool = True,
     ) -> None:
         """Initialize Auth0 OAuth provider.
 
@@ -79,6 +84,8 @@ class Auth0Provider(OIDCProxy):
             client_secret: Auth0 application client secret
             audience: Auth0 API audience
             base_url: Public URL where OAuth endpoints will be accessible (includes any mount path)
+            resource_base_url: Optional public base URL for the protected resource metadata
+                and token audience. Defaults to ``base_url``.
             issuer_url: Issuer URL for OAuth metadata (defaults to base_url). Use root-level URL
                 to avoid 404s during discovery when mounting under a path.
             required_scopes: Required Auth0 scopes (defaults to ["openid"])
@@ -86,15 +93,17 @@ class Auth0Provider(OIDCProxy):
             allowed_client_redirect_uris: List of allowed redirect URI patterns for MCP clients.
                 If None (default), all URIs are allowed. If empty list, no URIs are allowed.
             client_storage: Storage backend for OAuth state (client registrations, encrypted tokens).
-                If None, a DiskStore will be created in the data directory (derived from `platformdirs`). The
-                disk store will be encrypted using a key derived from the JWT Signing Key.
+                If None, an encrypted file store will be created in the data directory
+                (derived from `platformdirs`).
             jwt_signing_key: Secret for signing FastMCP JWT tokens (any string or bytes). If bytes are provided,
                 they will be used as is. If a string is provided, it will be derived into a 32-byte key. If not
                 provided, the upstream client secret will be used to derive a 32-byte key using PBKDF2.
             require_authorization_consent: Whether to require user consent before authorizing clients (default True).
                 When True, users see a consent screen before being redirected to Auth0.
                 When False, authorization proceeds directly without user confirmation.
-                SECURITY WARNING: Only disable for local development or testing environments.
+                When "external", the built-in consent screen is skipped but no warning is
+                logged, indicating that consent is handled externally (e.g. by the upstream IdP).
+                SECURITY WARNING: Only set to False for local development or testing environments.
         """
         # Parse scopes if provided as string
         auth0_required_scopes = (
@@ -107,6 +116,7 @@ class Auth0Provider(OIDCProxy):
             client_secret=client_secret,
             audience=audience,
             base_url=base_url,
+            resource_base_url=resource_base_url,
             issuer_url=issuer_url,
             redirect_path=redirect_path,
             required_scopes=auth0_required_scopes,
@@ -114,6 +124,8 @@ class Auth0Provider(OIDCProxy):
             client_storage=client_storage,
             jwt_signing_key=jwt_signing_key,
             require_authorization_consent=require_authorization_consent,
+            consent_csp_policy=consent_csp_policy,
+            forward_resource=forward_resource,
         )
 
         logger.debug(

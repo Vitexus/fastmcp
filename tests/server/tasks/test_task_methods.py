@@ -174,6 +174,7 @@ async def test_task_cancellation_workflow(endpoint_server):
         assert status.status == "cancelled"
 
 
+@pytest.mark.timeout(10)
 async def test_task_cancellation_interrupts_running_coroutine(endpoint_server):
     """Task cancellation actually interrupts the running coroutine.
 
@@ -181,7 +182,7 @@ async def test_task_cancellation_interrupts_running_coroutine(endpoint_server):
     coroutine receives CancelledError rather than continuing to completion.
     Requires pydocket >= 0.16.2.
 
-    See: https://github.com/jlowin/fastmcp/issues/2679
+    See: https://github.com/PrefectHQ/fastmcp/issues/2679
     """
     started = asyncio.Event()
     was_interrupted = asyncio.Event()

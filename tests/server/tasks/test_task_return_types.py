@@ -258,8 +258,10 @@ async def binary_type_server():
     [
         (
             "return_bytes",
-            str,
-            lambda r: "Hello bytes!" in r.data or "SGVsbG8gYnl0ZXMh" in r.data,
+            type(None),
+            lambda r: (
+                r.data is None and any("Hello bytes!" in c.text for c in r.content)
+            ),
         ),
         (
             "return_uuid",
@@ -402,9 +404,11 @@ async def media_server(tmp_path):
         ),
         (
             "return_image_data",
-            lambda r: len(r.content) == 1
-            and r.content[0].type == "image"
-            and r.content[0].mimeType == "image/png",
+            lambda r: (
+                len(r.content) == 1
+                and r.content[0].type == "image"
+                and r.content[0].mimeType == "image/png"
+            ),
         ),
         (
             "return_audio",
@@ -615,15 +619,19 @@ async def mcp_content_server(tmp_path):
     [
         (
             "return_text_content",
-            lambda r: len(r.content) == 1
-            and r.content[0].type == "text"
-            and r.content[0].text == "Direct text content",
+            lambda r: (
+                len(r.content) == 1
+                and r.content[0].type == "text"
+                and r.content[0].text == "Direct text content"
+            ),
         ),
         (
             "return_image_content",
-            lambda r: len(r.content) == 1
-            and r.content[0].type == "image"
-            and r.content[0].mimeType == "image/png",
+            lambda r: (
+                len(r.content) == 1
+                and r.content[0].type == "image"
+                and r.content[0].mimeType == "image/png"
+            ),
         ),
         (
             "return_embedded_resource",
@@ -631,9 +639,11 @@ async def mcp_content_server(tmp_path):
         ),
         (
             "return_resource_link",
-            lambda r: len(r.content) == 1
-            and r.content[0].type == "resource_link"
-            and str(r.content[0].uri) == "test://linked",
+            lambda r: (
+                len(r.content) == 1
+                and r.content[0].type == "resource_link"
+                and str(r.content[0].uri) == "test://linked"
+            ),
         ),
     ],
 )

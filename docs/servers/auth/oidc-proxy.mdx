@@ -70,12 +70,19 @@ mcp = FastMCP(name="My Server", auth=auth)
   Client ID from your registered OAuth application
 </ParamField>
 
-<ParamField body="client_secret" type="str" required>
-  Client secret from your registered OAuth application
+<ParamField body="client_secret" type="str | None">
+  Client secret from your registered OAuth application. Optional for PKCE public
+  clients. When omitted, `jwt_signing_key` must be provided.
 </ParamField>
 
 <ParamField body="base_url" type="AnyHttpUrl | str" required>
   Public URL of your FastMCP server (e.g., `https://your-server.com`)
+</ParamField>
+
+<ParamField body="resource_base_url" type="AnyHttpUrl | str | None">
+  Optional public base URL for the protected resource metadata and token audience.
+
+  Use this when your OAuth callbacks and operational endpoints need to live under one public URL, but the protected MCP resource should be advertised under another. FastMCP will still append the MCP mount path (for example, `/mcp`) to this base URL.
 </ParamField>
 
 <ParamField body="strict" type="bool | None">
@@ -231,6 +238,22 @@ Available providers include `Auth0Provider` at present.
 OAuth scopes are configured with `required_scopes` to automatically request the permissions your application needs.
 
 Dynamic clients created by the proxy will automatically include these scopes in their authorization requests.
+
+## CIMD Support
+
+<VersionBadge version="3.0.0" />
+
+The OIDC proxy inherits full CIMD (Client ID Metadata Document) support from `OAuthProxy`. Clients can use HTTPS URLs as their `client_id` instead of registering dynamically, and the proxy will fetch and validate their metadata document.
+
+See the [OAuth Proxy CIMD documentation](/servers/auth/oauth-proxy#cimd-support) for complete details on how CIMD works, including private key JWT authentication and security considerations.
+
+The CIMD-related parameters available on `OIDCProxy` are:
+
+<Card icon="code" title="CIMD Parameters">
+<ParamField body="enable_cimd" type="bool" default="True">
+  Whether to accept CIMD URLs as client identifiers.
+</ParamField>
+</Card>
 
 ## Production Configuration
 

@@ -30,6 +30,7 @@ Depends:
  python3-rich,
  python3-authlib,
  python3-pydantic,
+ python3-yaml,
  python3-pyperclip,
  python3-uvicorn,
  python3-websockets,
@@ -41,6 +42,8 @@ Depends:
  python3-jsonschema-path,
  python3-opentelemetry-api,
  python3-typing-inspection,
+ python3-uncalled-for,
+ python3-griffelib,
 Description: Fast, Pythonic way to build MCP servers and clients
  The Model Context Protocol (MCP) provides a standardized way to
  connect AI agents to tools and data. FastMCP makes it easy to build

@@ -8,6 +8,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, Literal, cast
 
+import anyio
 from mcp.types import (
     ClientCapabilities,
     CreateMessageResult,
@@ -31,6 +32,9 @@ from typing_extensions import TypeVar
 from fastmcp import settings
 from fastmcp.exceptions import ToolError
 from fastmcp.server.sampling.sampling_tool import SamplingTool
+from fastmcp.tools.function_tool import FunctionTool
+from fastmcp.tools.tool_transform import TransformedTool
+from fastmcp.utilities.async_utils import gather
 from fastmcp.utilities.json_schema import compress_schema
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import get_cached_typeadapter
@@ -42,8 +46,15 @@ if TYPE_CHECKING:
 
 ResultT = TypeVar("ResultT")
 
+# Maximum number of consecutive final_response validation retries (not
+# counting the initial attempt) before aborting.  Total attempts = N + 1.
+_MAX_VALIDATION_RETRIES = 3
+
 # Simplified tool choice type - just the mode string instead of the full MCP object
 ToolChoiceOption = Literal["auto", "required", "none"]
+
+# How many times we retry when the LLM returns text instead of calling final_response
+_MAX_TEXT_RESPONSE_RETRIES = 3
 
 
 @dataclass
@@ -223,6 +234,8 @@ async def call_sampling_handler(
     if inspect.isawaitable(result):
         result = await result
 
+    result = cast("str | CreateMessageResult | CreateMessageResultWithTools", result)
+
     # Convert string to CreateMessageResult
     if isinstance(result, str):
         return CreateMessageResult(
@@ -239,6 +252,7 @@ async def execute_tools(
     tool_calls: list[ToolUseContent],
     tool_map: dict[str, SamplingTool],
     mask_error_details: bool = False,
+    tool_concurrency: int | None = None,
 ) -> list[ToolResultContent]:
     """Execute tool calls and return results.
 
@@ -249,66 +263,96 @@ async def execute_tools(
             When masked, only generic error messages are returned to the LLM.
             Tools can explicitly raise ToolError to bypass masking when they want
             to provide specific error messages to the LLM.
+        tool_concurrency: Controls parallel execution of tools:
+            - None (default): Sequential execution (one at a time)
+            - 0: Unlimited parallel execution
+            - N > 0: Execute at most N tools concurrently
+            If any tool has sequential=True, all tools execute sequentially
+            regardless of this setting.
 
     Returns:
-        List of tool result content blocks.
+        List of tool result content blocks in the same order as tool_calls.
     """
-    tool_results: list[ToolResultContent] = []
+    if tool_concurrency is not None and tool_concurrency < 0:
+        raise ValueError(
+            f"tool_concurrency must be None, 0 (unlimited), or a positive integer, "
+            f"got {tool_concurrency}"
+        )
 
-    for tool_use in tool_calls:
+    async def _execute_single_tool(tool_use: ToolUseContent) -> ToolResultContent:
+        """Execute a single tool and return its result."""
         tool = tool_map.get(tool_use.name)
         if tool is None:
-            tool_results.append(
-                ToolResultContent(
-                    type="tool_result",
-                    toolUseId=tool_use.id,
-                    content=[
-                        TextContent(
-                            type="text",
-                            text=f"Error: Unknown tool '{tool_use.name}'",
-                        )
-                    ],
-                    isError=True,
-                )
+            return ToolResultContent(
+                type="tool_result",
+                toolUseId=tool_use.id,
+                content=[
+                    TextContent(
+                        type="text",
+                        text=f"Error: Unknown tool '{tool_use.name}'",
+                    )
+                ],
+                isError=True,
             )
-        else:
-            try:
-                result_value = await tool.run(tool_use.input)
-                tool_results.append(
-                    ToolResultContent(
-                        type="tool_result",
-                        toolUseId=tool_use.id,
-                        content=[TextContent(type="text", text=str(result_value))],
-                    )
-                )
-            except ToolError as e:
-                # ToolError is the escape hatch - always pass message through
-                logger.exception(f"Error calling sampling tool '{tool_use.name}'")
-                tool_results.append(
-                    ToolResultContent(
-                        type="tool_result",
-                        toolUseId=tool_use.id,
-                        content=[TextContent(type="text", text=str(e))],
-                        isError=True,
-                    )
-                )
-            except Exception as e:
-                # Generic exceptions - mask based on setting
-                logger.exception(f"Error calling sampling tool '{tool_use.name}'")
-                if mask_error_details:
-                    error_text = f"Error executing tool '{tool_use.name}'"
-                else:
-                    error_text = f"Error executing tool '{tool_use.name}': {e}"
-                tool_results.append(
-                    ToolResultContent(
-                        type="tool_result",
-                        toolUseId=tool_use.id,
-                        content=[TextContent(type="text", text=error_text)],
-                        isError=True,
-                    )
-                )
 
-    return tool_results
+        try:
+            result_value = await tool.run(tool_use.input)
+            return ToolResultContent(
+                type="tool_result",
+                toolUseId=tool_use.id,
+                content=[TextContent(type="text", text=str(result_value))],
+            )
+        except ToolError as e:
+            # ToolError is the escape hatch - always pass message through
+            logger.exception(f"Error calling sampling tool '{tool_use.name}'")
+            return ToolResultContent(
+                type="tool_result",
+                toolUseId=tool_use.id,
+                content=[TextContent(type="text", text=str(e))],
+                isError=True,
+            )
+        except Exception as e:
+            # Generic exceptions - mask based on setting
+            logger.exception(f"Error calling sampling tool '{tool_use.name}'")
+            if mask_error_details:
+                error_text = f"Error executing tool '{tool_use.name}'"
+            else:
+                error_text = f"Error executing tool '{tool_use.name}': {e}"
+            return ToolResultContent(
+                type="tool_result",
+                toolUseId=tool_use.id,
+                content=[TextContent(type="text", text=error_text)],
+                isError=True,
+            )
+
+    # Check if any tool requires sequential execution
+    requires_sequential = any(
+        tool.sequential
+        for tool_use in tool_calls
+        if (tool := tool_map.get(tool_use.name)) is not None
+    )
+
+    # Execute sequentially if required or if concurrency is None (default)
+    if tool_concurrency is None or requires_sequential:
+        tool_results: list[ToolResultContent] = []
+        for tool_use in tool_calls:
+            result = await _execute_single_tool(tool_use)
+            tool_results.append(result)
+        return tool_results
+
+    # Execute in parallel
+    if tool_concurrency == 0:
+        # Unlimited parallel execution
+        return await gather(*[_execute_single_tool(tc) for tc in tool_calls])
+    else:
+        # Bounded parallel execution with semaphore
+        semaphore = anyio.Semaphore(tool_concurrency)
+
+        async def bounded_execute(tool_use: ToolUseContent) -> ToolResultContent:
+            async with semaphore:
+                return await _execute_single_tool(tool_use)
+
+        return await gather(*[bounded_execute(tc) for tc in tool_calls])
 
 
 # --- Helper functions for sampling ---
@@ -334,9 +378,22 @@ def prepare_messages(
 
 
 def prepare_tools(
-    tools: Sequence[SamplingTool | Callable[..., Any]] | None,
+    tools: Sequence[SamplingTool | FunctionTool | TransformedTool | Callable[..., Any]]
+    | None,
 ) -> list[SamplingTool] | None:
-    """Convert tools to SamplingTool objects."""
+    """Convert tools to SamplingTool objects.
+
+    Accepts SamplingTool instances, FunctionTool instances, TransformedTool instances,
+    or plain callable functions. FunctionTool and TransformedTool are converted using
+    from_callable_tool(), while plain functions use from_function().
+
+    Args:
+        tools: Sequence of tools to prepare. Can be SamplingTool, FunctionTool,
+            TransformedTool, or plain callable functions.
+
+    Returns:
+        List of SamplingTool instances, or None if tools is None.
+    """
     if tools is None:
         return None
 
@@ -344,10 +401,14 @@ def prepare_tools(
     for t in tools:
         if isinstance(t, SamplingTool):
             sampling_tools.append(t)
+        elif isinstance(t, (FunctionTool, TransformedTool)):
+            sampling_tools.append(SamplingTool.from_callable_tool(t))
         elif callable(t):
             sampling_tools.append(SamplingTool.from_function(t))
         else:
-            raise TypeError(f"Expected SamplingTool or callable, got {type(t)}")
+            raise TypeError(
+                f"Expected SamplingTool, FunctionTool, TransformedTool, or callable, got {type(t)}"
+            )
 
     return sampling_tools if sampling_tools else None
 
@@ -408,10 +469,12 @@ async def sample_step_impl(
     temperature: float | None = None,
     max_tokens: int | None = None,
     model_preferences: ModelPreferences | str | list[str] | None = None,
-    tools: Sequence[SamplingTool | Callable[..., Any]] | None = None,
+    tools: Sequence[SamplingTool | FunctionTool | TransformedTool | Callable[..., Any]]
+    | None = None,
     tool_choice: ToolChoiceOption | str | None = None,
     auto_execute_tools: bool = True,
     mask_error_details: bool | None = None,
+    tool_concurrency: int | None = None,
 ) -> SampleStep:
     """Implementation of Context.sample_step().
 
@@ -498,7 +561,10 @@ async def sample_step_impl(
             else settings.mask_error_details
         )
         tool_results: list[ToolResultContent] = await execute_tools(
-            step_tool_calls, tool_map, mask_error_details=effective_mask
+            step_tool_calls,
+            tool_map,
+            mask_error_details=effective_mask,
+            tool_concurrency=tool_concurrency,
         )
 
         if tool_results:
@@ -520,9 +586,11 @@ async def sample_impl(
     temperature: float | None = None,
     max_tokens: int | None = None,
     model_preferences: ModelPreferences | str | list[str] | None = None,
-    tools: Sequence[SamplingTool | Callable[..., Any]] | None = None,
+    tools: Sequence[SamplingTool | FunctionTool | TransformedTool | Callable[..., Any]]
+    | None = None,
     result_type: type[ResultT] | None = None,
     mask_error_details: bool | None = None,
+    tool_concurrency: int | None = None,
 ) -> SamplingResult[ResultT]:
     """Implementation of Context.sample().
 
@@ -550,6 +618,9 @@ async def sample_impl(
     # Convert messages for the loop
     current_messages: str | Sequence[str | SamplingMessage] = messages
 
+    text_response_retries = 0
+    consecutive_validation_failures = 0
+
     for _iteration in range(max_iterations):
         step = await sample_step_impl(
             context,
@@ -561,12 +632,15 @@ async def sample_impl(
             tools=sampling_tools,
             tool_choice=tool_choice,
             mask_error_details=mask_error_details,
+            tool_concurrency=tool_concurrency,
         )
 
         # Check for final_response tool call for structured output
+        had_final_response = False
         if result_type is not None and result_type is not str and step.is_tool_use:
             for tool_call in step.tool_calls:
                 if tool_call.name == "final_response":
+                    had_final_response = True
                     # Validate and return the structured result
                     type_adapter = get_cached_typeadapter(result_type)
 
@@ -593,6 +667,13 @@ async def sample_impl(
                             history=step.history,
                         )
                     except ValidationError as e:
+                        consecutive_validation_failures += 1
+                        if consecutive_validation_failures > _MAX_VALIDATION_RETRIES:
+                            raise RuntimeError(
+                                f"Structured output validation failed "
+                                f"{consecutive_validation_failures} consecutive "
+                                f"times for type {result_type.__name__}: {e}"
+                            ) from e
                         # Validation failed - add error as tool result
                         step.history.append(
                             SamplingMessage(
@@ -616,15 +697,36 @@ async def sample_impl(
                             )
                         )
 
+        # The LLM called tools but not final_response — reset validation counter
+        if not had_final_response:
+            consecutive_validation_failures = 0
+
         # If not a tool use response, we're done
         if not step.is_tool_use:
             # For structured output, the LLM must use the final_response tool
             if result_type is not None and result_type is not str:
-                raise RuntimeError(
-                    f"Expected structured output of type {result_type.__name__}, "
-                    "but the LLM returned a text response instead of calling "
-                    "the final_response tool."
+                text_response_retries += 1
+                if text_response_retries > _MAX_TEXT_RESPONSE_RETRIES:
+                    raise RuntimeError(
+                        f"Expected structured output of type {result_type.__name__}, "
+                        "but the LLM returned a text response instead of calling "
+                        f"the final_response tool ({text_response_retries} attempts)."
+                    )
+                # Nudge the LLM to use the tool
+                step.history.append(
+                    SamplingMessage(
+                        role="user",
+                        content=TextContent(
+                            type="text",
+                            text=(
+                                "You must call the `final_response` tool to provide "
+                                "your answer. Do not respond with text — use the tool."
+                            ),
+                        ),
+                    )
                 )
+                current_messages = step.history
+                continue
             return SamplingResult(
                 text=step.text,
                 result=cast(ResultT, step.text if step.text else ""),
@@ -634,7 +736,8 @@ async def sample_impl(
         # Continue with the updated history
         current_messages = step.history
 
-        # After first iteration, reset tool_choice to auto
-        tool_choice = None
+        # After first iteration, reset tool_choice to auto (unless structured output is required)
+        if result_type is None or result_type is str:
+            tool_choice = None
 
     raise RuntimeError(f"Sampling exceeded maximum iterations ({max_iterations})")

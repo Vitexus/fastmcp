@@ -8,20 +8,22 @@ from __future__ import annotations
 
 import inspect
 from collections.abc import Callable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeVar
 
 import mcp.types
 from mcp.types import Annotations, AnyFunction
 
 import fastmcp
+from fastmcp.resources.base import Resource
 from fastmcp.resources.function_resource import resource as standalone_resource
-from fastmcp.resources.resource import Resource
 from fastmcp.resources.template import ResourceTemplate
+from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.tasks.config import TaskConfig
-from fastmcp.tools.tool import AuthCheckCallable
 
 if TYPE_CHECKING:
     from fastmcp.server.providers.local_provider import LocalProvider
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 
 class ResourceDecoratorMixin:
@@ -117,8 +119,8 @@ class ResourceDecoratorMixin:
         annotations: Annotations | dict[str, Any] | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
-    ) -> Callable[[AnyFunction], Resource | ResourceTemplate | AnyFunction]:
+        auth: AuthCheck | list[AuthCheck] | None = None,
+    ) -> Callable[[F], F]:
         """Decorator to register a function as a resource.
 
         If the URI contains parameters (e.g. "resource://{param}") or the function
@@ -166,7 +168,7 @@ class ResourceDecoratorMixin:
 
         resolved_task: bool | TaskConfig = task if task is not None else False
 
-        def decorator(fn: AnyFunction) -> Resource | ResourceTemplate | AnyFunction:
+        def decorator(fn: AnyFunction) -> Any:
             # Check for unbound method
             try:
                 params = list(inspect.signature(fn).parameters.keys())
@@ -233,7 +235,7 @@ class ResourceDecoratorMixin:
                     enabled=enabled,
                 )
                 target = fn.__func__ if hasattr(fn, "__func__") else fn
-                target.__fastmcp__ = metadata  # type: ignore[attr-defined]
+                target.__fastmcp__ = metadata  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
                 self.add_resource(fn)
                 return fn
 

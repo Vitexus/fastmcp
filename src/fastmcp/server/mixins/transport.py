@@ -22,6 +22,9 @@ from fastmcp.server.http import (
     create_sse_app,
     create_streamable_http_app,
 )
+from fastmcp.server.providers.base import Provider
+from fastmcp.server.providers.fastmcp_provider import FastMCPProvider
+from fastmcp.server.providers.wrapped_provider import _WrappedProvider
 from fastmcp.utilities.cli import log_server_banner
 from fastmcp.utilities.logging import get_logger, temporary_log_level
 
@@ -53,7 +56,7 @@ class TransportMixin:
         if show_banner is None:
             show_banner = fastmcp.settings.show_server_banner
         if transport is None:
-            transport = "stdio"
+            transport = fastmcp.settings.transport
         if transport not in {"stdio", "http", "sse", "streamable-http"}:
             raise ValueError(f"Unknown transport: {transport}")
 
@@ -145,15 +148,38 @@ class TransportMixin:
         return decorator
 
     def _get_additional_http_routes(self: FastMCP) -> list[BaseRoute]:
-        """Get all additional HTTP routes including from providers.
+        """Get all additional HTTP routes including from mounted servers.
 
-        Returns a list of all custom HTTP routes from this server and
-        from all providers that have HTTP routes (e.g., FastMCPProvider).
+        Collects custom HTTP routes registered via ``@server.custom_route()``
+        from this server **and** from any FastMCP servers reachable through
+        mounted providers (recursively).  This ensures that routes defined on
+        a child server are forwarded to the parent's HTTP app when using
+        ``server.mount(child)``.
+
+        Note:
+            When path collisions occur between a parent and a mounted child,
+            the parent's routes take precedence because they appear first in
+            the returned list.
 
         Returns:
-            List of Starlette BaseRoute objects
+            List of Starlette Route objects
         """
-        return list(self._additional_http_routes)
+        routes: list[BaseRoute] = list(self._additional_http_routes)
+
+        def _unwrap_provider(provider: Provider) -> Provider:
+            """Unwrap _WrappedProvider layers to find the inner provider."""
+            while isinstance(provider, _WrappedProvider):
+                provider = provider._inner
+            return provider
+
+        for provider in self.providers:
+            inner = _unwrap_provider(provider)
+            if isinstance(inner, FastMCPProvider):
+                # Recurse into the mounted server to collect its routes
+                # (and any routes from servers mounted on *it*).
+                routes.extend(inner.server._get_additional_http_routes())
+
+        return routes
 
     async def run_stdio_async(
         self: FastMCP,
@@ -231,16 +257,16 @@ class TransportMixin:
 
         # Resolve from settings/env var if not explicitly set
         if stateless_http is None:
-            stateless_http = self._deprecated_settings.stateless_http
+            stateless_http = fastmcp.settings.stateless_http
 
         # SSE doesn't support stateless mode
         if stateless_http and transport == "sse":
             raise ValueError("SSE transport does not support stateless mode")
 
-        host = host or self._deprecated_settings.host
-        port = port or self._deprecated_settings.port
+        host = host if host is not None else fastmcp.settings.host
+        port = port if port is not None else fastmcp.settings.port
         default_log_level_to_use = (
-            log_level or self._deprecated_settings.log_level
+            log_level if log_level is not None else fastmcp.settings.log_level
         ).lower()
 
         app = self.http_app(
@@ -257,7 +283,7 @@ class TransportMixin:
         uvicorn_config_from_user = uvicorn_config or {}
 
         config_kwargs: dict[str, Any] = {
-            "timeout_graceful_shutdown": 0,
+            "timeout_graceful_shutdown": 2,
             "lifespan": "on",
             "ws": "websockets-sansio",
         }
@@ -312,30 +338,31 @@ class TransportMixin:
             return create_streamable_http_app(
                 server=self,
                 streamable_http_path=path
-                or self._deprecated_settings.streamable_http_path,
+                if path is not None
+                else fastmcp.settings.streamable_http_path,
                 event_store=event_store,
                 retry_interval=retry_interval,
                 auth=self.auth,
                 json_response=(
                     json_response
                     if json_response is not None
-                    else self._deprecated_settings.json_response
+                    else fastmcp.settings.json_response
                 ),
                 stateless_http=(
                     stateless_http
                     if stateless_http is not None
-                    else self._deprecated_settings.stateless_http
+                    else fastmcp.settings.stateless_http
                 ),
-                debug=self._deprecated_settings.debug,
+                debug=fastmcp.settings.debug,
                 middleware=middleware,
             )
         elif transport == "sse":
             return create_sse_app(
                 server=self,
-                message_path=self._deprecated_settings.message_path,
-                sse_path=path or self._deprecated_settings.sse_path,
+                message_path=fastmcp.settings.message_path,
+                sse_path=path if path is not None else fastmcp.settings.sse_path,
                 auth=self.auth,
-                debug=self._deprecated_settings.debug,
+                debug=fastmcp.settings.debug,
                 middleware=middleware,
             )
         else:

@@ -6,3 +6,7 @@ py_key_value_aio python3-py-key-value-aio
 cyclopts python3-cyclopts
 jsonschema_path python3-jsonschema-path
 typing_inspection python3-typing-inspection
+uncalled_for python3-uncalled-for
+griffelib python3-griffelib
+watchfiles python3-watchfiles
+pyyaml python3-yaml

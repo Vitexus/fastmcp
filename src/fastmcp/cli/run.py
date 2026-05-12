@@ -3,15 +3,19 @@
 import asyncio
 import contextlib
 import json
+import os
 import re
 import signal
+import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal
 
 from mcp.server.fastmcp import FastMCP as FastMCP1x
 from watchfiles import Change, awatch
 
+import fastmcp
 from fastmcp.server.server import FastMCP, create_proxy
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.mcp_server_config import (
@@ -24,6 +28,57 @@ logger = get_logger("cli.run")
 # Type aliases for better type safety
 TransportType = Literal["stdio", "http", "sse", "streamable-http"]
 LogLevelType = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+# File extensions to watch for reload
+WATCHED_EXTENSIONS: set[str] = {
+    # Python
+    ".py",
+    # JavaScript/TypeScript
+    ".js",
+    ".ts",
+    ".jsx",
+    ".tsx",
+    # Markup/Content
+    ".html",
+    ".md",
+    ".mdx",
+    ".txt",
+    ".xml",
+    # Styles
+    ".css",
+    ".scss",
+    ".sass",
+    ".less",
+    # Data/Config
+    ".json",
+    ".yaml",
+    ".yml",
+    ".toml",
+    # Framework-specific
+    ".vue",
+    ".svelte",
+    # GraphQL
+    ".graphql",
+    ".gql",
+    # Images
+    ".svg",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".gif",
+    ".ico",
+    ".webp",
+    # Media
+    ".mp3",
+    ".mp4",
+    ".wav",
+    ".webm",
+    # Fonts
+    ".woff",
+    ".woff2",
+    ".ttf",
+    ".eot",
+}
 
 
 def is_url(path: str) -> bool:
@@ -127,11 +182,15 @@ async def run_command(
             config = load_mcp_server_config(config_path)
 
             # Merge deployment config with CLI arguments (CLI takes precedence)
-            transport = transport or config.deployment.transport
-            host = host or config.deployment.host
-            port = port or config.deployment.port
-            path = path or config.deployment.path
-            log_level = log_level or config.deployment.log_level
+            transport = (
+                transport if transport is not None else config.deployment.transport
+            )
+            host = host if host is not None else config.deployment.host
+            port = port if port is not None else config.deployment.port
+            path = path if path is not None else config.deployment.path
+            log_level = (
+                log_level if log_level is not None else config.deployment.log_level
+            )
             server_args = (
                 server_args if server_args is not None else config.deployment.args
             )
@@ -180,15 +239,22 @@ async def run_command(
         return
 
     kwargs = {}
-    if transport:
+    if transport is not None:
         kwargs["transport"] = transport
-    if host:
-        kwargs["host"] = host
-    if port:
-        kwargs["port"] = port
-    if path:
-        kwargs["path"] = path
-    if log_level:
+    # Resolve effective transport for the HTTP kwargs guard — transport
+    # may be None here if the user didn't pass --transport, in which case
+    # run_async will resolve it from settings.transport.
+    effective_transport = (
+        transport if transport is not None else fastmcp.settings.transport
+    )
+    if effective_transport != "stdio":
+        if host is not None:
+            kwargs["host"] = host
+        if port is not None:
+            kwargs["port"] = port
+        if path is not None:
+            kwargs["path"] = path
+    if log_level is not None:
         kwargs["log_level"] = log_level
     if stateless:
         kwargs["stateless"] = True
@@ -201,6 +267,45 @@ async def run_command(
     except Exception as e:
         logger.error(f"Failed to run server: {e}")
         sys.exit(1)
+
+
+def run_module_command(
+    module_name: str,
+    *,
+    env_command_builder: Callable[[list[str]], list[str]] | None = None,
+    extra_args: list[str] | None = None,
+) -> None:
+    """Run a Python module directly using ``python -m <module>``.
+
+    When ``-m`` is used, the module manages its own server startup.
+    No server-object discovery or transport overrides are applied.
+
+    Args:
+        module_name: Dotted module name (e.g. ``my_package``).
+        env_command_builder: An optional callable that wraps a command list
+            with environment setup (e.g. ``UVEnvironment.build_command``).
+        extra_args: Extra arguments forwarded after the module name.
+    """
+    # Use bare "python" when an env wrapper (e.g. uv run) is active so that
+    # the wrapper can resolve the interpreter via --python / environment config.
+    # Fall back to sys.executable for direct execution without a wrapper.
+    python = "python" if env_command_builder is not None else sys.executable
+    cmd: list[str] = [python, "-m", module_name]
+    if extra_args:
+        cmd.extend(extra_args)
+
+    # Wrap with environment (e.g. uv run) if configured
+    if env_command_builder is not None:
+        cmd = env_command_builder(cmd)
+
+    logger.debug(f"Running module: {' '.join(cmd)}")
+
+    try:
+        process = subprocess.run(cmd, check=True)
+        sys.exit(process.returncode)
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Module {module_name} exited with code {e.returncode}")
+        sys.exit(e.returncode)
 
 
 async def run_v1_server_async(
@@ -217,9 +322,9 @@ async def run_v1_server_async(
         port: Port to bind to
         transport: Transport protocol to use
     """
-    if host:
+    if host is not None:
         server.settings.host = host
-    if port:
+    if port is not None:
         server.settings.port = port
 
     match transport:
@@ -231,16 +336,40 @@ async def run_v1_server_async(
             await server.run_sse_async()
 
 
-def _python_file_filter(change: Change, path: str) -> bool:
-    """Filter for Python files only."""
-    return path.endswith(".py")
+def _watch_filter(_change: Change, path: str) -> bool:
+    """Filter for files that should trigger reload."""
+    return any(path.endswith(ext) for ext in WATCHED_EXTENSIONS)
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:
-    """Terminate a subprocess immediately."""
+    """Terminate a subprocess and all its children.
+
+    Sends SIGTERM to the process group first for graceful shutdown,
+    then falls back to SIGKILL if the process doesn't exit in time.
+    """
     if process.returncode is not None:
         return
-    process.kill()
+
+    pid = process.pid
+
+    if sys.platform != "win32":
+        # Send SIGTERM to the entire process group for graceful shutdown
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+
+        # Wait briefly for graceful exit
+        try:
+            await asyncio.wait_for(process.wait(), timeout=3.0)
+            return
+        except asyncio.TimeoutError:
+            pass
+
+        # Force kill the entire process group
+        with contextlib.suppress(ProcessLookupError, OSError):
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+    else:
+        process.kill()
+
     await process.wait()
 
 
@@ -296,11 +425,13 @@ async def run_with_reload(
                 stdin=None,
                 stdout=None,
                 stderr=None,
+                # Own process group so _terminate_process can kill the whole tree
+                start_new_session=sys.platform != "win32",
             )
 
             # Watch for either: file changes OR process death
             watch_task = asyncio.create_task(
-                anext(aiter(awatch(*watch_paths, watch_filter=_python_file_filter)))
+                anext(aiter(awatch(*watch_paths, watch_filter=_watch_filter)))  # ty: ignore[invalid-argument-type]
             )
             wait_task = asyncio.create_task(process.wait())
             shutdown_task = asyncio.create_task(shutdown_event.wait())
@@ -331,7 +462,7 @@ async def run_with_reload(
 
                 # Wait for file change or shutdown (avoid hot loop on crash)
                 watch_task = asyncio.create_task(
-                    anext(aiter(awatch(*watch_paths, watch_filter=_python_file_filter)))
+                    anext(aiter(awatch(*watch_paths, watch_filter=_watch_filter)))  # ty: ignore[invalid-argument-type]
                 )
                 shutdown_task = asyncio.create_task(shutdown_event.wait())
                 done, pending = await asyncio.wait(

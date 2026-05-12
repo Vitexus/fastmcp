@@ -12,7 +12,7 @@ from pydantic import Field, ValidationInfo
 from typing_extensions import override
 
 from fastmcp.exceptions import ResourceError
-from fastmcp.resources.resource import Resource, ResourceContent, ResourceResult
+from fastmcp.resources.base import Resource, ResourceContent, ResourceResult
 from fastmcp.utilities.logging import get_logger
 
 logger = get_logger(__name__)
@@ -26,7 +26,11 @@ class TextResource(Resource):
     async def read(self) -> ResourceResult:
         """Read the text content."""
         return ResourceResult(
-            contents=[ResourceContent(content=self.text, mime_type=self.mime_type)]
+            contents=[
+                ResourceContent(
+                    content=self.text, mime_type=self.mime_type, meta=self.meta
+                )
+            ]
         )
 
 
@@ -38,7 +42,11 @@ class BinaryResource(Resource):
     async def read(self) -> ResourceResult:
         """Read the binary content."""
         return ResourceResult(
-            contents=[ResourceContent(content=self.data, mime_type=self.mime_type)]
+            contents=[
+                ResourceContent(
+                    content=self.data, mime_type=self.mime_type, meta=self.meta
+                )
+            ]
         )
 
 
@@ -56,6 +64,14 @@ class FileResource(Resource):
     mime_type: str = Field(
         default="text/plain",
         description="MIME type of the resource content",
+    )
+    encoding: str | None = Field(
+        default="utf-8",
+        description=(
+            "Encoding to use when reading text files. "
+            "Defaults to 'utf-8' for cross-platform compatibility. "
+            "Set to None to use the system default encoding."
+        ),
     )
 
     @property
@@ -86,7 +102,7 @@ class FileResource(Resource):
             if self.is_binary:
                 content: str | bytes = await self._async_path.read_bytes()
             else:
-                content = await self._async_path.read_text()
+                content = await self._async_path.read_text(encoding=self.encoding)
             return ResourceResult(
                 contents=[ResourceContent(content=content, mime_type=self.mime_type)]
             )

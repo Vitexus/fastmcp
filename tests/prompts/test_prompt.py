@@ -2,7 +2,7 @@ import pytest
 from mcp.types import EmbeddedResource, TextResourceContents
 from pydantic import FileUrl
 
-from fastmcp.prompts.prompt import (
+from fastmcp.prompts.base import (
     Message,
     Prompt,
     PromptResult,
@@ -277,7 +277,7 @@ class TestPromptTypeConversion:
         with pytest.raises(PromptError) as exc_info:
             await prompt.render(arguments={"numbers": "not valid json"})
 
-        assert f"Error rendering prompt {prompt.name}" in str(exc_info.value)
+        assert f"Error rendering prompt {prompt.name!r}" in str(exc_info.value)
 
     async def test_json_parsing_fallback(self):
         """Test that JSON parsing falls back to direct validation when needed."""
@@ -430,6 +430,135 @@ class TestPromptArgumentDescriptions:
                     not in arg.description
                 )
 
+    def test_docstring_populates_argument_descriptions(self):
+        """Google-style docstrings should populate PromptArgument descriptions."""
+
+        def greet(name: str, topic: str) -> str:
+            """Generate a greeting.
+
+            Args:
+                name: The person's name.
+                topic: The topic to discuss.
+            """
+            return f"Hello {name}, let's talk about {topic}"
+
+        prompt = Prompt.from_function(greet)
+
+        # Description is summary-only — Args section stripped
+        assert prompt.description == "Generate a greeting."
+
+        assert prompt.arguments is not None
+        name_arg = next(arg for arg in prompt.arguments if arg.name == "name")
+        topic_arg = next(arg for arg in prompt.arguments if arg.name == "topic")
+        assert name_arg.description == "The person's name."
+        assert topic_arg.description == "The topic to discuss."
+
+    def test_docstring_works_with_numpy_and_sphinx_styles(self):
+        def numpy_prompt(a: str) -> str:
+            """Do something.
+
+            Parameters
+            ----------
+            a
+                The first argument.
+            """
+            return a
+
+        def sphinx_prompt(a: str) -> str:
+            """Do something.
+
+            :param a: The first argument.
+            """
+            return a
+
+        numpy = Prompt.from_function(numpy_prompt)
+        sphinx = Prompt.from_function(sphinx_prompt)
+
+        for prompt in (numpy, sphinx):
+            assert prompt.description == "Do something."
+            assert prompt.arguments is not None
+            a_arg = next(arg for arg in prompt.arguments if arg.name == "a")
+            assert a_arg.description == "The first argument."
+
+    def test_explicit_field_description_overrides_docstring(self):
+        """Field(description=...) takes precedence over docstring."""
+        from typing import Annotated
+
+        from pydantic import Field
+
+        def greet(
+            name: Annotated[str, Field(description="From Field")],
+        ) -> str:
+            """Greet.
+
+            Args:
+                name: From docstring (ignored).
+            """
+            return f"Hello {name}"
+
+        prompt = Prompt.from_function(greet)
+        assert prompt.arguments is not None
+        name_arg = next(arg for arg in prompt.arguments if arg.name == "name")
+        # Field description wins over the docstring's "From docstring (ignored)".
+        # (The existing schema-hint suffix for Annotated params is appended
+        # afterwards and is unrelated to precedence.)
+        assert name_arg.description is not None
+        assert name_arg.description.startswith("From Field")
+        assert "From docstring" not in name_arg.description
+
+    def test_explicit_description_keeps_docstring_arg_descriptions(self):
+        """Overriding the prompt description does not drop docstring-sourced
+        argument descriptions — they come from separate parsing paths."""
+
+        def greet(name: str) -> str:
+            """Greet.
+
+            Args:
+                name: The person's name.
+            """
+            return f"Hello {name}"
+
+        prompt = Prompt.from_function(greet, description="Custom description")
+        assert prompt.description == "Custom description"
+        assert prompt.arguments is not None
+        name_arg = next(arg for arg in prompt.arguments if arg.name == "name")
+        assert name_arg.description == "The person's name."
+
+    def test_docstring_without_args_section(self):
+        """Summary-only docstrings produce a description with no arg descriptions."""
+
+        def greet(name: str) -> str:
+            """Just a summary."""
+            return f"Hello {name}"
+
+        prompt = Prompt.from_function(greet)
+        assert prompt.description == "Just a summary."
+        assert prompt.arguments is not None
+        name_arg = next(arg for arg in prompt.arguments if arg.name == "name")
+        assert name_arg.description is None
+
+    def test_callable_class_sources_description_from_class(self):
+        """Class docstring drives the prompt description, while __call__'s
+        Args section drives per-argument descriptions (since the arguments
+        are __call__'s, not the class's)."""
+
+        class MyPrompt:
+            """Class-level description."""
+
+            def __call__(self, name: str) -> str:
+                """Internal call doc.
+
+                Args:
+                    name: From call.
+                """
+                return f"Hello {name}"
+
+        prompt = Prompt.from_function(MyPrompt())
+        assert prompt.description == "Class-level description."
+        assert prompt.arguments is not None
+        name_arg = next(arg for arg in prompt.arguments if arg.name == "name")
+        assert name_arg.description == "From call."
+
     def test_prompt_meta_parameter(self):
         """Test that meta parameter is properly handled."""
 
@@ -493,6 +622,36 @@ class TestMessage:
         assert isinstance(mcp_msg.content, TextContent)
         assert mcp_msg.content.text == "Hello"
 
+    def test_message_passthrough_image_content(self):
+        """Test Message passes through ImageContent without JSON serialization."""
+        from mcp.types import ImageContent
+
+        img = ImageContent(type="image", data="base64data", mimeType="image/png")
+        msg = Message(img, role="user")
+        assert isinstance(msg.content, ImageContent)
+        assert msg.content.data == "base64data"
+        assert msg.content.mimeType == "image/png"
+
+    def test_message_passthrough_audio_content(self):
+        """Test Message passes through AudioContent without JSON serialization."""
+        from mcp.types import AudioContent
+
+        audio = AudioContent(type="audio", data="base64audio", mimeType="audio/wav")
+        msg = Message(audio, role="user")
+        assert isinstance(msg.content, AudioContent)
+        assert msg.content.data == "base64audio"
+        assert msg.content.mimeType == "audio/wav"
+
+    def test_message_image_content_to_mcp_prompt_message(self):
+        """Test that ImageContent round-trips through to_mcp_prompt_message."""
+        from mcp.types import ImageContent
+
+        img = ImageContent(type="image", data="base64data", mimeType="image/png")
+        msg = Message(img, role="user")
+        mcp_msg = msg.to_mcp_prompt_message()
+        assert isinstance(mcp_msg.content, ImageContent)
+        assert mcp_msg.content.data == "base64data"
+
 
 class TestPromptResult:
     def test_promptresult_from_string(self):
@@ -520,12 +679,12 @@ class TestPromptResult:
     def test_promptresult_rejects_single_message(self):
         """Test PromptResult rejects single Message (must be in list)."""
         with pytest.raises(TypeError, match="must be str or list"):
-            PromptResult(Message("Hello"))  # type: ignore[arg-type]
+            PromptResult(Message("Hello"))  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
 
     def test_promptresult_rejects_dict(self):
         """Test PromptResult rejects dict."""
         with pytest.raises(TypeError, match="must be str or list"):
-            PromptResult({"key": "value"})  # type: ignore[arg-type]
+            PromptResult({"key": "value"})  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
 
     def test_promptresult_with_meta(self):
         """Test PromptResult with meta field."""
@@ -550,6 +709,88 @@ class TestPromptResult:
         assert len(mcp_result.messages) == 2
         assert mcp_result.description == "Test"
         assert mcp_result.meta == {"key": "value"}
+
+
+class TestPromptFieldDefaults:
+    """Test prompts with Field() defaults."""
+
+    async def test_field_with_default(self):
+        """Test that Field(default=...) correctly provides default values."""
+
+        from pydantic import Field
+
+        def prompt_with_defaults(
+            required: str = Field(description="Required parameter"),
+            optional: str = Field(
+                default="default_value", description="Optional parameter"
+            ),
+        ) -> str:
+            return f"required={required}, optional={optional}"
+
+        prompt = Prompt.from_function(prompt_with_defaults)
+        result = await prompt.render(arguments={"required": "test"})
+        assert result.messages == [Message("required=test, optional=default_value")]
+
+    async def test_annotated_field_with_default_in_signature(self):
+        """Test that Annotated[type, Field(...)] with default in signature works."""
+        from typing import Annotated
+
+        from pydantic import Field
+
+        def prompt_with_annotated(
+            required: Annotated[str, Field(description="Required parameter")],
+            optional: Annotated[
+                str, Field(description="Optional parameter")
+            ] = "default_value",
+        ) -> str:
+            return f"required={required}, optional={optional}"
+
+        prompt = Prompt.from_function(prompt_with_annotated)
+        result = await prompt.render(arguments={"required": "test"})
+        assert result.messages == [Message("required=test, optional=default_value")]
+
+    async def test_multiple_field_defaults(self):
+        """Test multiple parameters with Field() defaults."""
+        from pydantic import Field
+
+        def prompt_with_multiple_defaults(
+            name: str = Field(description="Name"),
+            greeting: str = Field(default="Hello", description="Greeting"),
+            punctuation: str = Field(default="!", description="Punctuation"),
+        ) -> str:
+            return f"{greeting}, {name}{punctuation}"
+
+        prompt = Prompt.from_function(prompt_with_multiple_defaults)
+
+        # Test with only required parameter
+        result1 = await prompt.render(arguments={"name": "World"})
+        assert result1.messages == [Message("Hello, World!")]
+
+        # Test overriding one default
+        result2 = await prompt.render(arguments={"name": "World", "greeting": "Hi"})
+        assert result2.messages == [Message("Hi, World!")]
+
+        # Test overriding all defaults
+        result3 = await prompt.render(
+            arguments={"name": "World", "greeting": "Greetings", "punctuation": "."}
+        )
+        assert result3.messages == [Message("Greetings, World.")]
+
+    async def test_field_defaults_with_type_conversion(self):
+        """Test Field() defaults work with type conversion for non-string types."""
+        from pydantic import Field
+
+        def prompt_with_typed_defaults(
+            count: int = Field(description="Count"),
+            multiplier: int = Field(default=2, description="Multiplier"),
+        ) -> str:
+            return f"result={count * multiplier}"
+
+        prompt = Prompt.from_function(prompt_with_typed_defaults)
+
+        # Pass count as string (MCP requirement), should use default for multiplier
+        result = await prompt.render(arguments={"count": "5"})
+        assert result.messages == [Message("result=10")]
 
 
 class TestPromptCallableAndConcurrency:

@@ -38,14 +38,17 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: ./.github/actions/setup-uv
+      - name: Setup uv
+        uses: ./.github/actions/setup-uv
         with:
           python-version: ${{ matrix.python-version }}
           resolution: locked
 
-      - uses: ./.github/actions/run-pytest
+      - name: Run unit tests
+        uses: ./.github/actions/run-pytest
 
-      - uses: ./.github/actions/run-pytest
+      - name: Run client process tests
+        uses: ./.github/actions/run-pytest
         with:
           test-type: client_process
 
@@ -57,15 +60,41 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: ./.github/actions/setup-uv
+      - name: Setup uv (lowest-direct)
+        uses: ./.github/actions/setup-uv
         with:
           resolution: lowest-direct
 
-      - uses: ./.github/actions/run-pytest
+      - name: Run unit tests
+        uses: ./.github/actions/run-pytest
 
-      - uses: ./.github/actions/run-pytest
+      - name: Run client process tests
+        uses: ./.github/actions/run-pytest
         with:
           test-type: client_process
+
+  run_conformance_tests:
+    name: "MCP conformance tests"
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup uv
+        uses: ./.github/actions/setup-uv
+        with:
+          resolution: locked
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Run conformance tests
+        uses: ./.github/actions/run-pytest
+        with:
+          test-type: conformance
 
   run_integration_tests:
     name: "Integration tests"
@@ -75,11 +104,13 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - uses: ./.github/actions/setup-uv
+      - name: Setup uv
+        uses: ./.github/actions/setup-uv
         with:
           resolution: locked
 
-      - uses: ./.github/actions/run-pytest
+      - name: Run integration tests
+        uses: ./.github/actions/run-pytest
         with:
           test-type: integration
         env:

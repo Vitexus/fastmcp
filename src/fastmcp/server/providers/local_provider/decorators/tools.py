@@ -7,25 +7,112 @@ registration functionality to LocalProvider.
 from __future__ import annotations
 
 import inspect
+import types
 import warnings
 from collections.abc import Callable
 from functools import partial
-from typing import TYPE_CHECKING, Any, Literal, overload
+from typing import (
+    TYPE_CHECKING,
+    Annotated,
+    Any,
+    Literal,
+    TypeVar,
+    Union,
+    get_args,
+    get_origin,
+    overload,
+)
 
 import mcp.types
 from mcp.types import AnyFunction, ToolAnnotations
 
 import fastmcp
+from fastmcp.exceptions import FastMCPDeprecationWarning
+from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.tasks.config import TaskConfig
+from fastmcp.tools.base import Tool
 from fastmcp.tools.function_tool import FunctionTool
-from fastmcp.tools.tool import AuthCheckCallable, Tool
 from fastmcp.utilities.types import NotSet, NotSetT
+
+try:
+    from prefab_ui.app import PrefabApp as _PrefabApp
+    from prefab_ui.components.base import Component as _PrefabComponent
+
+    _HAS_PREFAB = True
+except ImportError:
+    _HAS_PREFAB = False
 
 if TYPE_CHECKING:
     from fastmcp.server.providers.local_provider import LocalProvider
-    from fastmcp.tools.tool import ToolResultSerializerType
+    from fastmcp.tools.base import ToolResultSerializerType
+
+F = TypeVar("F", bound=Callable[..., Any])
 
 DuplicateBehavior = Literal["error", "warn", "replace", "ignore"]
+
+PREFAB_RENDERER_URI = "ui://prefab/renderer.html"
+
+
+def _is_prefab_type(tp: Any) -> bool:
+    """Check if *tp* is or contains a prefab type, recursing through unions and Annotated."""
+    if isinstance(tp, type) and issubclass(tp, (_PrefabApp, _PrefabComponent)):
+        return True
+    origin = get_origin(tp)
+    if origin is Union or origin is types.UnionType or origin is Annotated:
+        return any(_is_prefab_type(a) for a in get_args(tp))
+    return False
+
+
+def _has_prefab_return_type(tool: Tool) -> bool:
+    """Check if a FunctionTool's return type annotation is a prefab type."""
+    if not _HAS_PREFAB or not isinstance(tool, FunctionTool):
+        return False
+    rt = tool.return_type
+    if rt is None or rt is inspect.Parameter.empty:
+        return False
+    return _is_prefab_type(rt)
+
+
+def _stamp_prefab_marker(tool: Tool) -> None:
+    """Mark a tool as needing a Prefab renderer resource.
+
+    Sets ``meta["ui"]["resourceUri"]`` to a placeholder URI. The server
+    recognizes the placeholder at list_tools / list_resources / read_resource
+    time and synthesizes a per-tool resource on the fly with a hashed URI
+    derived from the tool's mount-point address. Nothing is stored — the
+    renderer HTML and CSP are generated on demand from the tool's own meta.
+    """
+    from fastmcp.apps.config import AppConfig, app_config_to_meta_dict
+
+    app_config = AppConfig(resource_uri=PREFAB_RENDERER_URI)
+    meta = dict(tool.meta) if tool.meta else {}
+    meta["ui"] = app_config_to_meta_dict(app_config)
+    tool.meta = meta
+
+
+def _maybe_apply_prefab_ui(provider: LocalProvider, tool: Tool) -> None:
+    """Mark a tool as a Prefab tool if its config or return type implies it.
+
+    Per-tool renderer resources are synthesized lazily at list/read time;
+    here we only normalize the tool's meta so the synthesis pass can spot
+    it. ``app=True``, return-type inference, and ``PrefabAppConfig`` all
+    funnel through the same placeholder marker.
+    """
+    if not _HAS_PREFAB:
+        return
+
+    meta = tool.meta or {}
+    ui = meta.get("ui")
+
+    if ui is True:
+        # Explicit app=True: stamp the placeholder so the synthesizer finds it.
+        _stamp_prefab_marker(tool)
+    elif ui is None and _has_prefab_return_type(tool):
+        # Inference: return type is a prefab type, stamp the placeholder.
+        _stamp_prefab_marker(tool)
+    # Otherwise the tool either has no ui meta at all (not a prefab tool)
+    # or it already has a fully-formed dict from FastMCP.tool(app=...) — the
+    # synthesizer picks up both flavors by looking for the placeholder URI.
 
 
 class ToolDecoratorMixin:
@@ -46,38 +133,51 @@ class ToolDecoratorMixin:
             from fastmcp.decorators import get_fastmcp_meta
             from fastmcp.tools.function_tool import ToolMeta
 
-            meta = get_fastmcp_meta(tool)
-            if meta is not None and isinstance(meta, ToolMeta):
-                resolved_task = meta.task if meta.task is not None else False
-                enabled = meta.enabled
+            fmeta = get_fastmcp_meta(tool)
+            if fmeta is not None and isinstance(fmeta, ToolMeta):
+                resolved_task = fmeta.task if fmeta.task is not None else False
+                enabled = fmeta.enabled
+
+                # Merge ToolMeta.app into the meta dict
+                tool_meta = fmeta.meta
+                if fmeta.app is not None:
+                    from fastmcp.apps.config import app_config_to_meta_dict
+
+                    tool_meta = dict(tool_meta) if tool_meta else {}
+                    if fmeta.app is True:
+                        tool_meta["ui"] = True
+                    else:
+                        tool_meta["ui"] = app_config_to_meta_dict(fmeta.app)
+
                 tool = Tool.from_function(
                     tool,
-                    name=meta.name,
-                    version=meta.version,
-                    title=meta.title,
-                    description=meta.description,
-                    icons=meta.icons,
-                    tags=meta.tags,
-                    output_schema=meta.output_schema,
-                    annotations=meta.annotations,
-                    meta=meta.meta,
+                    name=fmeta.name,
+                    version=fmeta.version,
+                    title=fmeta.title,
+                    description=fmeta.description,
+                    icons=fmeta.icons,
+                    tags=fmeta.tags,
+                    output_schema=fmeta.output_schema,
+                    annotations=fmeta.annotations,
+                    meta=tool_meta,
                     task=resolved_task,
-                    exclude_args=meta.exclude_args,
-                    serializer=meta.serializer,
-                    timeout=meta.timeout,
-                    auth=meta.auth,
+                    exclude_args=fmeta.exclude_args,
+                    serializer=fmeta.serializer,
+                    timeout=fmeta.timeout,
+                    auth=fmeta.auth,
                 )
             else:
                 tool = Tool.from_function(tool)
         self._add_component(tool)
         if not enabled:
             self.disable(keys={tool.key})
+        _maybe_apply_prefab_ui(self, tool)
         return tool
 
     @overload
     def tool(
         self: LocalProvider,
-        name_or_fn: AnyFunction,
+        name_or_fn: F,
         *,
         name: str | None = None,
         version: str | int | None = None,
@@ -93,8 +193,8 @@ class ToolDecoratorMixin:
         task: bool | TaskConfig | None = None,
         serializer: ToolResultSerializerType | None = None,  # Deprecated
         timeout: float | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
-    ) -> FunctionTool: ...
+        auth: AuthCheck | list[AuthCheck] | None = None,
+    ) -> F: ...
 
     @overload
     def tool(
@@ -115,8 +215,8 @@ class ToolDecoratorMixin:
         task: bool | TaskConfig | None = None,
         serializer: ToolResultSerializerType | None = None,  # Deprecated
         timeout: float | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
-    ) -> Callable[[AnyFunction], FunctionTool]: ...
+        auth: AuthCheck | list[AuthCheck] | None = None,
+    ) -> Callable[[F], F]: ...
 
     # NOTE: This method mirrors fastmcp.tools.tool() but adds registration,
     # the `enabled` param, and supports deprecated params (serializer, exclude_args).
@@ -140,7 +240,7 @@ class ToolDecoratorMixin:
         task: bool | TaskConfig | None = None,
         serializer: ToolResultSerializerType | None = None,  # Deprecated
         timeout: float | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+        auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> (
         Callable[[AnyFunction], FunctionTool]
         | FunctionTool
@@ -191,7 +291,7 @@ class ToolDecoratorMixin:
                 "The `serializer` parameter is deprecated. "
                 "Return ToolResult from your tools for full control over serialization. "
                 "See https://gofastmcp.com/servers/tools#custom-serialization for migration examples.",
-                DeprecationWarning,
+                FastMCPDeprecationWarning,
                 stacklevel=2,
             )
         if isinstance(annotations, dict):
@@ -249,6 +349,7 @@ class ToolDecoratorMixin:
                 self._add_component(tool_obj)
                 if not enabled:
                     self.disable(keys={tool_obj.key})
+                _maybe_apply_prefab_ui(self, tool_obj)
                 return tool_obj
             else:
                 from fastmcp.tools.function_tool import ToolMeta
@@ -271,7 +372,7 @@ class ToolDecoratorMixin:
                     enabled=enabled,
                 )
                 target = fn.__func__ if hasattr(fn, "__func__") else fn
-                target.__fastmcp__ = metadata  # type: ignore[attr-defined]
+                target.__fastmcp__ = metadata  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
                 tool_obj = self.add_tool(fn)
                 return fn
 

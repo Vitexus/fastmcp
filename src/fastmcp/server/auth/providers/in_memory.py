@@ -37,6 +37,7 @@ class InMemoryOAuthProvider(OAuthProvider):
     def __init__(
         self,
         base_url: AnyHttpUrl | str | None = None,
+        resource_base_url: AnyHttpUrl | str | None = None,
         service_documentation_url: AnyHttpUrl | str | None = None,
         client_registration_options: ClientRegistrationOptions | None = None,
         revocation_options: RevocationOptions | None = None,
@@ -44,6 +45,7 @@ class InMemoryOAuthProvider(OAuthProvider):
     ):
         super().__init__(
             base_url=base_url or "http://fastmcp.example.com",
+            resource_base_url=resource_base_url,
             service_documentation_url=service_documentation_url,
             client_registration_options=client_registration_options,
             revocation_options=revocation_options,
@@ -284,7 +286,7 @@ class InMemoryOAuthProvider(OAuthProvider):
             scope=" ".join(scopes),
         )
 
-    async def load_access_token(self, token: str) -> AccessToken | None:  # type: ignore[override]
+    async def load_access_token(self, token: str) -> AccessToken | None:  # type: ignore[override]  # ty:ignore[invalid-method-override]
         token_obj = self.access_tokens.get(token)
         if token_obj:
             if token_obj.expires_at is not None and token_obj.expires_at < time.time():
@@ -295,7 +297,7 @@ class InMemoryOAuthProvider(OAuthProvider):
             return token_obj
         return None
 
-    async def verify_token(self, token: str) -> AccessToken | None:  # type: ignore[override]
+    async def verify_token(self, token: str) -> AccessToken | None:  # type: ignore[override]  # ty:ignore[invalid-method-override]
         """
         Verify a bearer token and return access info if valid.
 

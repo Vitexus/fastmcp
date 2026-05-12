@@ -6,12 +6,14 @@ handle task-augmented execution as specified in SEP-1686.
 
 from __future__ import annotations
 
+import functools
 import inspect
-import warnings
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Literal
+
+from fastmcp.utilities.async_utils import is_coroutine_function
 
 # Task execution modes per SEP-1686 / MCP ToolExecution.taskSupport
 TaskMode = Literal["forbidden", "optional", "required"]
@@ -125,28 +127,21 @@ class TaskConfig:
 
         # Unwrap callable classes and staticmethods
         fn_to_check = fn
-        if not inspect.isroutine(fn) and callable(fn):
+        if (
+            not inspect.isroutine(fn)
+            and not isinstance(fn, functools.partial)
+            and callable(fn)
+        ):
             fn_to_check = fn.__call__
         if isinstance(fn_to_check, staticmethod):
             fn_to_check = fn_to_check.__func__
 
-        if not inspect.iscoroutinefunction(fn_to_check):
+        if not is_coroutine_function(fn_to_check):
             raise ValueError(
                 f"'{name}' uses a sync function but has task execution enabled. "
                 "Background tasks require async functions."
             )
 
-        # Warn if function uses Context - it won't be available in workers
-        from fastmcp.server.context import Context
-        from fastmcp.utilities.types import find_kwarg_by_type
-
-        context_kwarg = find_kwarg_by_type(fn_to_check, Context)
-        if context_kwarg:
-            warnings.warn(
-                f"'{name}' uses Context but has task execution enabled. "
-                "Context is not available in background task workers because "
-                "there is no active MCP session. Consider using Docket dependencies "
-                "like Progress() instead for worker-compatible functionality.",
-                UserWarning,
-                stacklevel=4,
-            )
+        # Note: Context IS now available in background task workers (SEP-1686)
+        # The wiring in _CurrentContext creates a task-aware Context with task_id
+        # and session from the registry. No warning needed.

@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
 import re
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, ClassVar, overload
-from urllib.parse import parse_qs, unquote
+from urllib.parse import parse_qs, quote, unquote
 
 import mcp.types
 from mcp.types import Annotations, Icon
+from pydantic.json_schema import SkipJsonSchema
 
 if TYPE_CHECKING:
     from docket import Docket
@@ -21,15 +23,16 @@ from pydantic import (
     validate_call,
 )
 
-from fastmcp.resources.resource import Resource, ResourceResult
+from fastmcp.resources.base import Resource, ResourceResult
+from fastmcp.server.auth.authorization import AuthCheck
 from fastmcp.server.dependencies import (
     transform_context_annotations,
     without_injected_parameters,
 )
 from fastmcp.server.tasks.config import TaskConfig, TaskMeta
-from fastmcp.tools.tool import AuthCheckCallable
 from fastmcp.utilities.components import FastMCPComponent
 from fastmcp.utilities.json_schema import compress_schema
+from fastmcp.utilities.mime import resolve_ui_mime_type
 from fastmcp.utilities.types import get_cached_typeadapter
 
 
@@ -41,13 +44,16 @@ def extract_query_params(uri_template: str) -> set[str]:
     return set()
 
 
-def build_regex(template: str) -> re.Pattern:
+def build_regex(template: str) -> re.Pattern[str] | None:
     """Build regex pattern for URI template, handling RFC 6570 syntax.
 
     Supports:
     - `{var}` - simple path parameter
     - `{var*}` - wildcard path parameter (captures multiple segments)
     - `{?var1,var2}` - query parameters (ignored in path matching)
+
+    Returns None if the template produces an invalid regex (e.g. parameter
+    names with hyphens, leading digits, or duplicates from a remote server).
     """
     # Remove query parameter syntax for path matching
     template_without_query = re.sub(r"\{\?[^}]+\}", "", template)
@@ -64,7 +70,10 @@ def build_regex(template: str) -> re.Pattern:
                 pattern += f"(?P<{name}>[^/]+)"
         else:
             pattern += re.escape(part)
-    return re.compile(f"^{pattern}$")
+    try:
+        return re.compile(f"^{pattern}$")
+    except re.error:
+        return None
 
 
 def match_uri_template(uri: str, uri_template: str) -> dict[str, str] | None:
@@ -79,6 +88,8 @@ def match_uri_template(uri: str, uri_template: str) -> dict[str, str] | None:
 
     # Match path parameters
     regex = build_regex(uri_template)
+    if regex is None:
+        return None
     match = regex.match(uri_path)
     if not match:
         return None
@@ -98,6 +109,38 @@ def match_uri_template(uri: str, uri_template: str) -> dict[str, str] | None:
     return params
 
 
+def expand_uri_template(uri_template: str, params: dict[str, Any]) -> str:
+    """Expand a URI template with parameters — inverse of `match_uri_template`.
+
+    Supports the same RFC 6570 subset:
+    - Path params: `{var}`, `{var*}`
+    - Query params: `{?var1,var2}`
+    """
+    result = uri_template
+
+    # Replace {name} and {name*} path placeholders
+    for key, value in params.items():
+        value_str = str(value)
+        result = result.replace(f"{{{key}}}", value_str)
+        result = result.replace(f"{{{key}*}}", value_str)
+
+    # Expand {?param1,param2,...} query parameter blocks
+    def _expand_query_block(match: re.Match[str]) -> str:
+        names = [n.strip() for n in match.group(1).split(",")]
+        parts = [
+            f"{quote(name)}={quote(str(params[name]))}"
+            for name in names
+            if name in params
+        ]
+        if parts:
+            return "?" + "&".join(parts)
+        return ""
+
+    result = re.sub(r"\{\?([^}]+)\}", _expand_query_block, result)
+
+    return result
+
+
 class ResourceTemplate(FastMCPComponent):
     """A template for dynamically creating resources."""
 
@@ -115,7 +158,7 @@ class ResourceTemplate(FastMCPComponent):
     annotations: Annotations | None = Field(
         default=None, description="Optional annotations about the resource's behavior"
     )
-    auth: AuthCheckCallable | list[AuthCheckCallable] | None = Field(
+    auth: SkipJsonSchema[AuthCheck | list[AuthCheck] | None] = Field(
         default=None,
         description="Authorization checks for this resource template",
         exclude=True,
@@ -138,7 +181,7 @@ class ResourceTemplate(FastMCPComponent):
         annotations: Annotations | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+        auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> FunctionResourceTemplate:
         return FunctionResourceTemplate.from_function(
             fn=fn,
@@ -265,7 +308,7 @@ class ResourceTemplate(FastMCPComponent):
             annotations=overrides.get("annotations", self.annotations),
             _meta=overrides.get(  # type: ignore[call-arg]  # _meta is Pydantic alias for meta field
                 "_meta", self.get_meta()
-            ),
+            ),  # ty:ignore[unknown-argument]
         )
 
     @classmethod
@@ -326,7 +369,7 @@ class ResourceTemplate(FastMCPComponent):
 class FunctionResourceTemplate(ResourceTemplate):
     """A template for dynamically creating resources."""
 
-    fn: Callable[..., Any]
+    fn: SkipJsonSchema[Callable[..., Any]]
 
     @overload
     async def _read(
@@ -407,9 +450,17 @@ class FunctionResourceTemplate(ResourceTemplate):
                     elif annotation is float:
                         kwargs[param_name] = float(param_value)
                     elif annotation is bool:
-                        kwargs[param_name] = param_value.lower() in ("true", "1", "yes")
+                        lower = param_value.lower()
+                        if lower in ("true", "1", "yes"):
+                            kwargs[param_name] = True
+                        elif lower in ("false", "0", "no"):
+                            kwargs[param_name] = False
+                        else:
+                            raise ValueError(
+                                f"Invalid boolean value for {param_name}: {param_value!r}"
+                            )
                 except (ValueError, AttributeError):
-                    pass
+                    raise
 
         # self.fn is wrapped by without_injected_parameters which handles
         # dependency resolution internally, so we call it directly
@@ -420,11 +471,7 @@ class FunctionResourceTemplate(ResourceTemplate):
         return result
 
     def register_with_docket(self, docket: Docket) -> None:
-        """Register this template with docket for background execution.
-
-        FunctionResourceTemplate registers the underlying function, which has the
-        user's Depends parameters for docket to resolve.
-        """
+        """Register this template with docket for background execution."""
         if not self.task_config.supports_tasks():
             return
         docket.register(self.fn, names=[self.key])
@@ -469,7 +516,7 @@ class FunctionResourceTemplate(ResourceTemplate):
         annotations: Annotations | None = None,
         meta: dict[str, Any] | None = None,
         task: bool | TaskConfig | None = None,
-        auth: AuthCheckCallable | list[AuthCheckCallable] | None = None,
+        auth: AuthCheck | list[AuthCheck] | None = None,
     ) -> FunctionResourceTemplate:
         """Create a template from a function."""
 
@@ -538,7 +585,7 @@ class FunctionResourceTemplate(ResourceTemplate):
                     f"URI parameters {all_uri_params} must be a subset of the function arguments: {func_params}"
                 )
 
-        description = description or inspect.getdoc(fn)
+        description = description if description is not None else inspect.getdoc(fn)
 
         # Normalize task to TaskConfig and validate
         if task is None:
@@ -550,7 +597,7 @@ class FunctionResourceTemplate(ResourceTemplate):
         task_config.validate_function(fn, func_name)
 
         # if the fn is a callable class, we need to get the __call__ method from here out
-        if not inspect.isroutine(fn):
+        if not inspect.isroutine(fn) and not isinstance(fn, functools.partial):
             fn = fn.__call__
         # if the fn is a staticmethod, we need to work with the underlying function
         if isinstance(fn, staticmethod):
@@ -567,6 +614,9 @@ class FunctionResourceTemplate(ResourceTemplate):
         # Use validate_call on wrapper for runtime type coercion
         fn = validate_call(wrapper_fn)
 
+        # Apply ui:// MIME default, then fall back to text/plain
+        resolved_mime = resolve_ui_mime_type(uri_template, mime_type)
+
         return cls(
             uri_template=uri_template,
             name=func_name,
@@ -574,7 +624,7 @@ class FunctionResourceTemplate(ResourceTemplate):
             title=title,
             description=description,
             icons=icons,
-            mime_type=mime_type or "text/plain",
+            mime_type=resolved_mime or "text/plain",
             fn=fn,
             parameters=parameters,
             tags=tags or set(),

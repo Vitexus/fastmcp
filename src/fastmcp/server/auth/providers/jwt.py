@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import contextlib
+import json
 import time
 from dataclasses import dataclass
 from typing import Any, cast
@@ -15,6 +17,7 @@ from pydantic import AnyHttpUrl, SecretStr
 from typing_extensions import TypedDict
 
 from fastmcp.server.auth import AccessToken, TokenVerifier
+from fastmcp.server.auth.ssrf import SSRFError, SSRFFetchError, ssrf_safe_fetch
 from fastmcp.utilities.auth import decode_jwt_header, parse_scopes
 from fastmcp.utilities.logging import get_logger
 
@@ -111,7 +114,7 @@ class RSAKeyPair:
             header["kid"] = kid
 
         # Create payload
-        payload = {
+        payload: dict[str, str | int | list[str]] = {
             "sub": subject,
             "iss": issuer,
             "iat": int(time.time()),
@@ -136,6 +139,20 @@ class RSAKeyPair:
         return token_bytes.decode("utf-8")
 
 
+def _looks_like_pem_public_key(key: str | bytes) -> bool:
+    """Return True when key text appears to be PEM-encoded asymmetric key material."""
+    if isinstance(key, bytes):
+        key = key.decode("utf-8", errors="replace")
+    key_text = key.strip()
+    pem_markers = (
+        "-----BEGIN PUBLIC KEY-----",
+        "-----BEGIN RSA PUBLIC KEY-----",
+        "-----BEGIN EC PUBLIC KEY-----",
+        "-----BEGIN CERTIFICATE-----",
+    )
+    return any(marker in key_text for marker in pem_markers)
+
+
 class JWTVerifier(TokenVerifier):
     """
     JWT token verifier supporting both asymmetric (RSA/ECDSA) and symmetric (HMAC) algorithms.
@@ -158,13 +175,15 @@ class JWTVerifier(TokenVerifier):
     def __init__(
         self,
         *,
-        public_key: str | None = None,
+        public_key: str | bytes | None = None,
         jwks_uri: str | None = None,
         issuer: str | list[str] | None = None,
         audience: str | list[str] | None = None,
         algorithm: str | None = None,
         required_scopes: list[str] | None = None,
         base_url: AnyHttpUrl | str | None = None,
+        ssrf_safe: bool = False,
+        http_client: httpx.AsyncClient | None = None,
     ):
         """
         Initialize a JWTVerifier configured to validate JWTs using either a static key or a JWKS endpoint.
@@ -177,15 +196,31 @@ class JWTVerifier(TokenVerifier):
             algorithm: JWT signing algorithm to accept (default: "RS256"). Supported: HS256/384/512, RS256/384/512, ES256/384/512, PS256/384/512.
             required_scopes: Scopes that must be present in validated tokens.
             base_url: Base URL passed to the parent TokenVerifier.
+            ssrf_safe: If True, JWKS fetches use SSRF protection (HTTPS-only,
+                public IPs, DNS pinning). Enable when the JWKS URI comes from
+                untrusted input (e.g. CIMD documents). Defaults to False so
+                operator-configured JWKS URIs (including localhost) work normally.
+            http_client: Optional httpx.AsyncClient for connection pooling. When provided,
+                the client is reused for JWKS fetches and the caller is responsible for
+                its lifecycle. When None (default), a fresh client is created per fetch.
+                Cannot be used with ssrf_safe=True.
 
         Raises:
-            ValueError: If neither or both of `public_key` and `jwks_uri` are provided, or if `algorithm` is unsupported.
+            ValueError: If neither or both of `public_key` and `jwks_uri` are provided,
+                if `algorithm` is unsupported, or if `http_client` is provided with `ssrf_safe=True`.
         """
         if not public_key and not jwks_uri:
             raise ValueError("Either public_key or jwks_uri must be provided")
 
         if public_key and jwks_uri:
             raise ValueError("Provide either public_key or jwks_uri, not both")
+
+        # Only enforce ssrf_safe/http_client exclusivity when JWKS fetching is used
+        if jwks_uri and ssrf_safe and http_client is not None:
+            raise ValueError(
+                "http_client cannot be used with ssrf_safe=True; "
+                "SSRF-safe mode requires its own hardened transport"
+            )
 
         algorithm = algorithm or "RS256"
         if algorithm not in {
@@ -204,6 +239,17 @@ class JWTVerifier(TokenVerifier):
         }:
             raise ValueError(f"Unsupported algorithm: {algorithm}.")
 
+        if algorithm.startswith("HS"):
+            if jwks_uri:
+                raise ValueError(
+                    "Symmetric HS* algorithms cannot be used with jwks_uri; "
+                    "configure a shared secret via public_key instead."
+                )
+            if public_key and _looks_like_pem_public_key(public_key):
+                raise ValueError(
+                    "Symmetric HS* algorithms require a shared secret, not a public key."
+                )
+
         # Parse scopes if provided as string
         parsed_required_scopes = (
             parse_scopes(required_scopes) if required_scopes is not None else None
@@ -220,6 +266,8 @@ class JWTVerifier(TokenVerifier):
         self.audience = audience
         self.public_key = public_key
         self.jwks_uri = jwks_uri
+        self.ssrf_safe = ssrf_safe
+        self._http_client = http_client
         self.jwt = JsonWebToken([self.algorithm])
         self.logger = get_logger(__name__)
 
@@ -228,7 +276,7 @@ class JWTVerifier(TokenVerifier):
         self._jwks_cache_time: float = 0
         self._cache_ttl = 3600  # 1 hour
 
-    async def _get_verification_key(self, token: str) -> str:
+    async def _get_verification_key(self, token: str) -> str | bytes:
         """Get the verification key for the token."""
         if self.public_key:
             return self.public_key
@@ -239,11 +287,11 @@ class JWTVerifier(TokenVerifier):
             kid = header.get("kid")
             return await self._get_jwks_key(kid)
 
-        except Exception as e:
+        except (ValueError, KeyError, IndexError, json.JSONDecodeError) as e:
             raise ValueError(f"Failed to extract key ID from token: {e}") from e
 
     async def _get_jwks_key(self, kid: str | None) -> str:
-        """Fetch key from JWKS with simple caching."""
+        """Fetch key from JWKS with simple caching and SSRF protection."""
         if not self.jwks_uri:
             raise ValueError("JWKS URI not configured")
 
@@ -257,12 +305,9 @@ class JWTVerifier(TokenVerifier):
                 # If no kid but only one key cached, use it
                 return next(iter(self._jwks_cache.values()))
 
-        # Fetch JWKS
+        # Fetch JWKS — with SSRF protection when enabled (untrusted URIs)
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(self.jwks_uri)
-                response.raise_for_status()
-                jwks_data = response.json()
+            jwks_data = await self._fetch_jwks()
 
             # Cache all keys
             self._jwks_cache = {}
@@ -298,11 +343,39 @@ class JWTVerifier(TokenVerifier):
                 else:
                     raise ValueError("No keys found in JWKS")
 
+        except (SSRFError, SSRFFetchError) as e:
+            self.logger.debug("JWKS fetch blocked by SSRF protection: %s", e)
+            raise ValueError(f"Failed to fetch JWKS: {e}") from e
         except httpx.HTTPError as e:
             raise ValueError(f"Failed to fetch JWKS: {e}") from e
-        except Exception as e:
-            self.logger.debug(f"JWKS fetch failed: {e}")
-            raise ValueError(f"Failed to fetch JWKS: {e}") from e
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JWKS JSON: {e}") from e
+        except (JoseError, TypeError, KeyError) as e:
+            self.logger.debug("JWKS key processing failed: %s", e)
+            raise ValueError(f"Failed to process JWKS: {e}") from e
+
+    async def _fetch_jwks(self) -> dict[str, Any]:
+        """Fetch JWKS data, using SSRF-safe or standard fetch based on config."""
+        if not self.jwks_uri:
+            raise ValueError("JWKS URI not configured")
+
+        if self.ssrf_safe:
+            content = await ssrf_safe_fetch(
+                self.jwks_uri,
+                max_size=65536,
+                timeout=10.0,
+                overall_timeout=30.0,
+            )
+            return json.loads(content)
+        else:
+            async with (
+                contextlib.nullcontext(self._http_client)
+                if self._http_client is not None
+                else httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+            ) as client:
+                response = await client.get(self.jwks_uri)
+                response.raise_for_status()
+                return response.json()
 
     def _extract_scopes(self, claims: dict[str, Any]) -> list[str]:
         """
@@ -346,13 +419,16 @@ class JWTVerifier(TokenVerifier):
                 or "unknown"
             )
 
-            # Validate expiration
+            # Validate expiration. Kept at INFO (not WARNING like issuer/
+            # audience/scope mismatches below) — expiry is expected-path noise
+            # from normal token rotation, not a configuration error worth
+            # surfacing by default.
             exp = claims.get("exp")
-            if exp and exp < time.time():
-                self.logger.debug(
-                    "Token validation failed: expired token for client %s", client_id
+            if exp is not None and exp < time.time():
+                self.logger.info(
+                    "Bearer token rejected for client %s: token expired",
+                    client_id,
                 )
-                self.logger.info("Bearer token rejected for client %s", client_id)
                 return None
 
             # Validate issuer - note we use issuer instead of issuer_url here because
@@ -370,11 +446,13 @@ class JWTVerifier(TokenVerifier):
                     issuer_valid = iss == self.issuer
 
                 if not issuer_valid:
-                    self.logger.debug(
-                        "Token validation failed: issuer mismatch for client %s",
+                    self.logger.warning(
+                        "Bearer token rejected for client %s: issuer mismatch "
+                        "(got %r, expected %r)",
                         client_id,
+                        iss,
+                        self.issuer,
                     )
-                    self.logger.info("Bearer token rejected for client %s", client_id)
                     return None
 
             # Validate audience if configured
@@ -401,11 +479,13 @@ class JWTVerifier(TokenVerifier):
                         audience_valid = aud == self.audience
 
                 if not audience_valid:
-                    self.logger.debug(
-                        "Token validation failed: audience mismatch for client %s",
+                    self.logger.warning(
+                        "Bearer token rejected for client %s: audience mismatch "
+                        "(got %r, expected %r)",
                         client_id,
+                        aud,
+                        self.audience,
                     )
-                    self.logger.info("Bearer token rejected for client %s", client_id)
                     return None
 
             # Extract scopes
@@ -416,26 +496,27 @@ class JWTVerifier(TokenVerifier):
                 token_scopes = set(scopes)
                 required_scopes = set(self.required_scopes)
                 if not required_scopes.issubset(token_scopes):
-                    self.logger.debug(
-                        "Token missing required scopes. Has: %s, Required: %s",
-                        token_scopes,
-                        required_scopes,
+                    self.logger.warning(
+                        "Bearer token rejected for client %s: missing required "
+                        "scopes (has %s, requires %s)",
+                        client_id,
+                        sorted(token_scopes),
+                        sorted(required_scopes),
                     )
-                    self.logger.info("Bearer token rejected for client %s", client_id)
                     return None
 
             return AccessToken(
                 token=token,
                 client_id=str(client_id),
                 scopes=scopes,
-                expires_at=int(exp) if exp else None,
+                expires_at=int(exp) if exp is not None else None,
                 claims=claims,
             )
 
         except JoseError:
             self.logger.debug("Token validation failed: JWT signature/format invalid")
             return None
-        except Exception as e:
+        except (ValueError, TypeError, KeyError, AttributeError) as e:
             self.logger.debug("Token validation failed: %s", str(e))
             return None
 

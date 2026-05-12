@@ -78,7 +78,9 @@ class ErrorHandlingMiddleware(Middleware):
             except Exception as callback_error:
                 self.logger.error(f"Error in error callback: {callback_error}")
 
-    def _transform_error(self, error: Exception) -> Exception:
+    def _transform_error(
+        self, error: Exception, context: MiddlewareContext
+    ) -> Exception:
         """Transform non-MCP errors to proper MCP errors."""
         if isinstance(error, McpError):
             return error
@@ -94,9 +96,13 @@ class ErrorHandlingMiddleware(Middleware):
                 ErrorData(code=-32602, message=f"Invalid params: {error!s}")
             )
         elif error_type in (FileNotFoundError, KeyError, NotFoundError):
-            return McpError(
-                ErrorData(code=-32001, message=f"Resource not found: {error!s}")
-            )
+            # MCP spec defines -32002 specifically for resource not found
+            method = context.method or ""
+            if method.startswith("resources/"):
+                return McpError(
+                    ErrorData(code=-32002, message=f"Resource not found: {error!s}")
+                )
+            return McpError(ErrorData(code=-32001, message=f"Not found: {error!s}"))
         elif error_type is PermissionError:
             return McpError(
                 ErrorData(code=-32000, message=f"Permission denied: {error!s}")
@@ -119,7 +125,7 @@ class ErrorHandlingMiddleware(Middleware):
             self._log_error(error, context)
 
             # Transform and re-raise
-            transformed_error = self._transform_error(error)
+            transformed_error = self._transform_error(error, context)
             raise transformed_error from error
 
     def get_error_stats(self) -> dict[str, int]:
@@ -175,8 +181,18 @@ class RetryMiddleware(Middleware):
         self.logger = logger or logging.getLogger("fastmcp.retry")
 
     def _should_retry(self, error: Exception) -> bool:
-        """Determine if an error should trigger a retry."""
-        return isinstance(error, self.retry_exceptions)
+        """Determine if an error should trigger a retry.
+
+        Checks both the error itself and its ``__cause__``, since FastMCP
+        wraps tool exceptions as ``ToolError(...) from original``. Only one
+        level of cause is inspected — middleware below this one must not
+        re-wrap errors with a new ``from`` clause, or the real type will be
+        hidden from the retry decision.
+        """
+        if isinstance(error, self.retry_exceptions):
+            return True
+        cause = error.__cause__
+        return cause is not None and isinstance(cause, self.retry_exceptions)
 
     def _calculate_delay(self, attempt: int) -> float:
         """Calculate delay for the given attempt number."""

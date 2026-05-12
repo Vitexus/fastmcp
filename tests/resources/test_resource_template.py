@@ -7,7 +7,11 @@ from pydantic import BaseModel
 from fastmcp import Context, FastMCP
 from fastmcp.resources import ResourceTemplate
 from fastmcp.resources.function_resource import FunctionResource
-from fastmcp.resources.template import match_uri_template
+from fastmcp.resources.template import (
+    build_regex,
+    expand_uri_template,
+    match_uri_template,
+)
 
 
 class TestResourceTemplate:
@@ -749,261 +753,143 @@ class TestContextHandling:
             assert result == "item: 42"
 
 
-class TestQueryParameterExtraction:
-    """Test basic query parameter extraction from URIs."""
+class TestMalformedURITemplates:
+    """Test that malformed URI templates from remote servers don't crash."""
 
-    async def test_single_query_param(self):
-        """Test resource template with single query parameter."""
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "test://{bad-name}/path",
+            "test://{hyphen-param}/{other-param}/path",
+            "test://{1leading}/path",
+            "test://{123}/path",
+        ],
+        ids=[
+            "hyphen_in_name",
+            "multiple_hyphens",
+            "leading_digit",
+            "all_digits",
+        ],
+    )
+    def test_build_regex_returns_none_for_invalid_group_names(self, template: str):
+        assert build_regex(template) is None
 
-        def get_data(id: str, format: str = "json") -> str:
-            return f"Data {id} in {format}"
+    def test_build_regex_returns_none_for_duplicate_group_names(self):
+        assert build_regex("test://{a}/{a}/path") is None
 
-        template = ResourceTemplate.from_function(
-            fn=get_data,
-            uri_template="data://{id}{?format}",
+    @pytest.mark.parametrize(
+        "template",
+        [
+            "test://{bad-name}/path",
+            "test://{a}/{a}/path",
+            "test://{1leading}/path",
+        ],
+        ids=[
+            "hyphen_in_name",
+            "duplicate_groups",
+            "leading_digit",
+        ],
+    )
+    def test_match_uri_template_returns_none_for_malformed_templates(
+        self, template: str
+    ):
+        assert match_uri_template("test://anything/path", template) is None
+
+    def test_resource_template_matches_returns_none_for_malformed_template(self):
+        template = ResourceTemplate(
+            uri_template="test://{bad-name}/path",
             name="test",
+            parameters={},
+        )
+        assert template.matches("test://anything/path") is None
+
+    def test_build_regex_still_works_for_valid_templates(self):
+        regex = build_regex("test://{name}/{id}")
+        assert regex is not None
+        match = regex.match("test://foo/123")
+        assert match is not None
+        assert match.group("name") == "foo"
+        assert match.group("id") == "123"
+
+
+class TestExpandUriTemplate:
+    """Test expand_uri_template — the inverse of match_uri_template."""
+
+    @pytest.mark.parametrize(
+        "template, params, expected",
+        [
+            ("test://{x}", {"x": "foo"}, "test://foo"),
+            ("test://{x}/{y}", {"x": "foo", "y": "bar"}, "test://foo/bar"),
+            ("test://a/{x}/b", {"x": "mid"}, "test://a/mid/b"),
+        ],
+    )
+    def test_expand_simple_params(
+        self, template: str, params: dict[str, str], expected: str
+    ):
+        assert expand_uri_template(template, params) == expected
+
+    @pytest.mark.parametrize(
+        "template, params, expected",
+        [
+            ("test://{path*}", {"path": "a/b/c"}, "test://a/b/c"),
+            ("test://{path*}", {"path": "single"}, "test://single"),
+            ("test://pre/{rest*}", {"rest": "x/y"}, "test://pre/x/y"),
+            (
+                "test://{a*}/mid/{b*}",
+                {"a": "x/y", "b": "p/q"},
+                "test://x/y/mid/p/q",
+            ),
+            ("test://{x}/{path*}", {"x": "foo", "path": "a/b"}, "test://foo/a/b"),
+        ],
+    )
+    def test_expand_wildcard_params(
+        self, template: str, params: dict[str, str], expected: str
+    ):
+        assert expand_uri_template(template, params) == expected
+
+    def test_expand_query_params(self):
+        result = expand_uri_template(
+            "test://data{?format,verbose}",
+            {"format": "json", "verbose": "true"},
+        )
+        assert result in (
+            "test://data?format=json&verbose=true",
+            "test://data?verbose=true&format=json",
         )
 
-        # Match without query param (uses default)
-        params = template.matches("data://123")
-        assert params == {"id": "123"}
-
-        # Match with query param
-        params = template.matches("data://123?format=xml")
-        assert params == {"id": "123", "format": "xml"}
-
-    async def test_multiple_query_params(self):
-        """Test resource template with multiple query parameters."""
-
-        def get_items(category: str, page: int = 1, limit: int = 10) -> str:
-            return f"Category {category}, page {page}, limit {limit}"
-
-        template = ResourceTemplate.from_function(
-            fn=get_items,
-            uri_template="items://{category}{?page,limit}",
-            name="test",
+    def test_expand_query_params_partial(self):
+        result = expand_uri_template(
+            "test://data{?format,verbose}",
+            {"format": "json"},
         )
+        assert result == "test://data?format=json"
 
-        # No query params
-        params = template.matches("items://books")
-        assert params == {"category": "books"}
+    def test_expand_query_params_none(self):
+        result = expand_uri_template("test://data{?format,verbose}", {})
+        assert result == "test://data"
 
-        # One query param
-        params = template.matches("items://books?page=2")
-        assert params == {"category": "books", "page": "2"}
-
-        # Both query params
-        params = template.matches("items://books?page=2&limit=20")
-        assert params == {"category": "books", "page": "2", "limit": "20"}
+    def test_expand_ignores_extra_params(self):
+        result = expand_uri_template("test://{x}", {"x": "foo", "unused": "bar"})
+        assert result == "test://foo"
 
 
-class TestQueryParameterTypeCoercion:
-    """Test type coercion for query parameters."""
+class TestMatchExpandRoundTrip:
+    """match_uri_template and expand_uri_template must agree on the template grammar."""
 
-    async def test_int_coercion(self):
-        """Test integer type coercion for query parameters."""
-
-        def get_page(resource: str, page: int = 1) -> dict:
-            return {"resource": resource, "page": page, "type": type(page).__name__}
-
-        template = ResourceTemplate.from_function(
-            fn=get_page,
-            uri_template="resource://{resource}{?page}",
-            name="test",
-        )
-
-        # Create resource with string query param
-        resource = await template.create_resource(
-            "resource://docs?page=5",
-            {"resource": "docs", "page": "5"},
-        )
-
-        # read() returns raw dict
-        result = await resource.read()
-        assert isinstance(result, dict)
-        assert result["page"] == 5
-        assert result["type"] == "int"
-
-    async def test_bool_coercion(self):
-        """Test boolean type coercion for query parameters."""
-
-        def get_config(name: str, enabled: bool = False) -> dict:
-            return {"name": name, "enabled": enabled, "type": type(enabled).__name__}
-
-        template = ResourceTemplate.from_function(
-            fn=get_config,
-            uri_template="config://{name}{?enabled}",
-            name="test",
-        )
-
-        # Test true value
-        resource = await template.create_resource(
-            "config://feature?enabled=true",
-            {"name": "feature", "enabled": "true"},
-        )
-        # read() returns raw dict
-        result = await resource.read()
-        assert isinstance(result, dict)
-        assert result["enabled"] is True
-
-        # Test false value
-        resource = await template.create_resource(
-            "config://feature?enabled=false",
-            {"name": "feature", "enabled": "false"},
-        )
-        result = await resource.read()
-        assert isinstance(result, dict)
-        assert result["enabled"] is False
-
-    async def test_float_coercion(self):
-        """Test float type coercion for query parameters."""
-
-        def get_metrics(service: str, threshold: float = 0.5) -> dict:
-            return {
-                "service": service,
-                "threshold": threshold,
-                "type": type(threshold).__name__,
-            }
-
-        template = ResourceTemplate.from_function(
-            fn=get_metrics,
-            uri_template="metrics://{service}{?threshold}",
-            name="test",
-        )
-
-        resource = await template.create_resource(
-            "metrics://api?threshold=0.95",
-            {"service": "api", "threshold": "0.95"},
-        )
-
-        # read() returns raw dict
-        result = await resource.read()
-        assert isinstance(result, dict)
-        assert result["threshold"] == 0.95
-        assert result["type"] == "float"
-
-
-class TestQueryParameterValidation:
-    """Test validation rules for query parameters."""
-
-    def test_query_params_must_be_optional(self):
-        """Test that query parameters must have default values."""
-
-        def invalid_func(id: str, format: str) -> str:
-            return f"Data {id} in {format}"
-
-        with pytest.raises(
-            ValueError,
-            match="Query parameters .* must be optional function parameters with default values",
-        ):
-            ResourceTemplate.from_function(
-                fn=invalid_func,
-                uri_template="data://{id}{?format}",
-                name="test",
-            )
-
-    def test_required_params_in_path(self):
-        """Test that required parameters must be in path."""
-
-        def valid_func(id: str, format: str = "json") -> str:
-            return f"Data {id} in {format}"
-
-        # This should work - required param in path, optional in query
-        template = ResourceTemplate.from_function(
-            fn=valid_func,
-            uri_template="data://{id}{?format}",
-            name="test",
-        )
-        assert template.uri_template == "data://{id}{?format}"
-
-
-class TestQueryParameterWithDefaults:
-    """Test that missing query parameters use default values."""
-
-    async def test_missing_query_param_uses_default(self):
-        """Test that missing query parameters fall back to defaults."""
-
-        def get_data(id: str, format: str = "json", verbose: bool = False) -> dict:
-            return {"id": id, "format": format, "verbose": verbose}
-
-        template = ResourceTemplate.from_function(
-            fn=get_data,
-            uri_template="data://{id}{?format,verbose}",
-            name="test",
-        )
-
-        # No query params - should use defaults
-        resource = await template.create_resource(
-            "data://123",
-            {"id": "123"},
-        )
-
-        # read() returns raw dict
-        result = await resource.read()
-        assert isinstance(result, dict)
-        assert result["format"] == "json"
-        assert result["verbose"] is False
-
-    async def test_partial_query_params(self):
-        """Test providing only some query parameters."""
-
-        def get_data(
-            id: str, format: str = "json", limit: int = 10, offset: int = 0
-        ) -> dict:
-            return {"id": id, "format": format, "limit": limit, "offset": offset}
-
-        template = ResourceTemplate.from_function(
-            fn=get_data,
-            uri_template="data://{id}{?format,limit,offset}",
-            name="test",
-        )
-
-        # Provide only some query params
-        resource = await template.create_resource(
-            "data://123?limit=20",
-            {"id": "123", "limit": "20"},
-        )
-
-        # read() returns raw dict
-        result = await resource.read()
-        assert isinstance(result, dict)
-        assert result["format"] == "json"  # default
-        assert result["limit"] == 20  # provided
-        assert result["offset"] == 0  # default
-
-
-class TestQueryParameterWithWildcards:
-    """Test query parameters combined with wildcard path parameters."""
-
-    async def test_wildcard_with_query_params(self):
-        """Test combining wildcard path params with query params."""
-
-        def get_file(path: str, encoding: str = "utf-8", lines: int = 100) -> dict:
-            return {"path": path, "encoding": encoding, "lines": lines}
-
-        template = ResourceTemplate.from_function(
-            fn=get_file,
-            uri_template="files://{path*}{?encoding,lines}",
-            name="test",
-        )
-
-        # Match path with query params
-        params = template.matches("files://src/test/data.txt?encoding=ascii&lines=50")
-        assert params == {
-            "path": "src/test/data.txt",
-            "encoding": "ascii",
-            "lines": "50",
-        }
-
-        # Create resource
-        resource = await template.create_resource(
-            "files://src/test/data.txt?lines=50",
-            {"path": "src/test/data.txt", "lines": "50"},
-        )
-
-        # read() returns raw dict
-        result = await resource.read()
-        assert isinstance(result, dict)
-        assert result["path"] == "src/test/data.txt"
-        assert result["encoding"] == "utf-8"  # default
-        assert result["lines"] == 50  # provided
+    @pytest.mark.parametrize(
+        "template, uri",
+        [
+            ("test://{x}", "test://foo"),
+            ("test://{x}/{y}", "test://foo/bar"),
+            ("test://a/{x}/b", "test://a/mid/b"),
+            ("test://{path*}", "test://a/b/c"),
+            ("test://{path*}", "test://single"),
+            ("test://pre/{rest*}", "test://pre/x/y/z"),
+            ("test://{x}/{path*}", "test://foo/a/b/c"),
+        ],
+    )
+    def test_expand_then_match_is_identity(self, template: str, uri: str):
+        """Extracting params from a URI and expanding them back reproduces the URI."""
+        params = match_uri_template(uri, template)
+        assert params is not None
+        assert expand_uri_template(template, params) == uri

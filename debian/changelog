@@ -1,3 +1,12 @@
+fastmcp (3.2.4-1) unstable; urgency=medium
+
+  * Update to upstream v3.2.4
+  * Add python3-uncalled-for, python3-griffelib, python3-yaml dependencies
+  * Bump watchfiles requirement to >= 1.0.0
+  * Update py-key-value-aio to filetree variant >= 0.4.4
+
+ -- Vítězslav Dvořák <info@vitexsoftware.cz>  Tue, 12 May 2026 09:30:00 +0200
+
 fastmcp (2.14.4-1) unstable; urgency=medium
 
   * Initial Debian package release

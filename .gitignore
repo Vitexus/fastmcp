@@ -65,11 +65,13 @@ dmypy.json
 
 # Claude worktree management
 .claude-wt/worktrees
+.claude/worktrees/
 
 # Agents
 /PLAN.md
 /TODO.md
 /STATUS.md
+plans/
 
 # Common FastMCP test files
 /test.py

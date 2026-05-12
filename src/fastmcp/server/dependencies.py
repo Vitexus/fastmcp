@@ -1,19 +1,22 @@
 """Dependency injection for FastMCP.
 
 DI features (Depends, CurrentContext, CurrentFastMCP) work without pydocket
-using a vendored DI engine. Only task-related dependencies (CurrentDocket,
+using the uncalled-for DI engine. Only task-related dependencies (CurrentDocket,
 CurrentWorker) and background task execution require fastmcp[tasks].
 """
 
 from __future__ import annotations
 
 import contextlib
+import importlib.metadata
 import inspect
 import weakref
 from collections.abc import AsyncGenerator, Callable
 from contextlib import AsyncExitStack, asynccontextmanager
 from contextvars import ContextVar
+from datetime import datetime, timezone
 from functools import lru_cache
+from types import TracebackType
 from typing import TYPE_CHECKING, Any, Protocol, cast, get_type_hints, runtime_checkable
 
 from mcp.server.auth.middleware.auth_context import (
@@ -24,12 +27,18 @@ from mcp.server.auth.provider import (
     AccessToken as _SDKAccessToken,
 )
 from mcp.server.lowlevel.server import request_ctx
+from packaging.version import Version
 from starlette.requests import Request
+from uncalled_for import Dependency, get_dependency_parameters
+from uncalled_for.resolution import _Depends
 
 from fastmcp.exceptions import FastMCPError
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.http import _current_http_request
-from fastmcp.utilities.async_utils import call_sync_fn_in_threadpool
+from fastmcp.utilities.async_utils import (
+    call_sync_fn_in_threadpool,
+    is_coroutine_function,
+)
 from fastmcp.utilities.types import find_kwarg_by_type, is_class_member_of_type
 
 if TYPE_CHECKING:
@@ -50,12 +59,19 @@ __all__ = [
     "CurrentRequest",
     "CurrentWorker",
     "Progress",
+    "TaskContextInfo",
+    "TaskContextSnapshot",
+    "TokenClaim",
     "get_access_token",
     "get_context",
     "get_http_headers",
     "get_http_request",
     "get_server",
+    "get_task_context",
+    "get_task_session",
     "is_docket_available",
+    "register_task_server",
+    "register_task_session",
     "require_docket",
     "resolve_dependencies",
     "transform_context_annotations",
@@ -63,11 +79,26 @@ __all__ = [
 ]
 
 
-# --- ContextVars ---
+# Task context lives in fastmcp.server.tasks.context; public symbols are
+# re-exported here so existing imports from dependencies continue to work.
+# _get_task_snapshot_sync and _load_task_snapshot_async are not re-exported
+# but are used internally by get_access_token / get_http_request / get_server.
+from fastmcp.server.tasks.context import (
+    TaskContextInfo,
+    TaskContextSnapshot,
+    _get_task_snapshot_sync,
+    _load_task_snapshot_async,
+    get_task_context,
+    get_task_server,
+    get_task_session,
+    register_task_server,
+    register_task_session,
+)
 
 _current_server: ContextVar[weakref.ref[FastMCP] | None] = ContextVar(
     "server", default=None
 )
+
 _current_docket: ContextVar[Docket | None] = ContextVar("docket", default=None)
 _current_worker: ContextVar[Worker | None] = ContextVar("worker", default=None)
 
@@ -77,15 +108,34 @@ _current_worker: ContextVar[Worker | None] = ContextVar("worker", default=None)
 _DOCKET_AVAILABLE: bool | None = None
 
 
+_MIN_DOCKET_VERSION = Version("0.19.0")
+
+
 def is_docket_available() -> bool:
-    """Check if pydocket is installed."""
+    """Check if a compatible pydocket (>= 0.19.0) is installed and importable.
+
+    Three things have to be true for fastmcp's task features to work:
+      1. pydocket distribution metadata is discoverable
+      2. its version is at least ``_MIN_DOCKET_VERSION`` (older versions are
+         missing symbols like ``docket.dependencies.current_execution``,
+         which fastmcp imports on the request hot path)
+      3. the package actually imports — guards against broken/partial
+         installs where metadata exists but ``import docket`` blows up
+
+    Any of those failing means we treat docket as unavailable and fall back
+    to the no-tasks code paths instead of crashing deep inside a request.
+    """
     global _DOCKET_AVAILABLE
     if _DOCKET_AVAILABLE is None:
         try:
-            import docket  # noqa: F401
+            installed = Version(importlib.metadata.version("pydocket"))
+            if installed < _MIN_DOCKET_VERSION:
+                _DOCKET_AVAILABLE = False
+            else:
+                import docket  # noqa: F401
 
-            _DOCKET_AVAILABLE = True
-        except ImportError:
+                _DOCKET_AVAILABLE = True
+        except (importlib.metadata.PackageNotFoundError, ImportError):
             _DOCKET_AVAILABLE = False
     return _DOCKET_AVAILABLE
 
@@ -97,36 +147,34 @@ def require_docket(feature: str) -> None:
         feature: Description of what requires docket (e.g., "`task=True`",
                  "CurrentDocket()"). Will be included in the error message.
     """
-    if not is_docket_available():
-        raise ImportError(
-            f"FastMCP background tasks require the `tasks` extra. "
-            f"Install with: pip install 'fastmcp[tasks]'. "
-            f"(Triggered by {feature})"
+    if is_docket_available():
+        return
+
+    try:
+        installed = importlib.metadata.version("pydocket")
+    except importlib.metadata.PackageNotFoundError:
+        installed = None
+
+    if installed is None:
+        detail = (
+            "FastMCP background tasks require the `tasks` extra. "
+            "Install with: pip install 'fastmcp[tasks]'."
+        )
+    else:
+        detail = (
+            f"FastMCP background tasks require pydocket>={_MIN_DOCKET_VERSION}, "
+            f"but pydocket {installed} is installed (likely pulled in by another "
+            f"package). Upgrade with: pip install -U 'pydocket>={_MIN_DOCKET_VERSION}'."
         )
 
+    raise ImportError(f"{detail} (Triggered by {feature})")
 
-# --- Dependency injection imports ---
-# Try docket first for isinstance compatibility in worker context,
-# fall back to vendored DI engine when docket is not installed.
 
-try:
-    from docket.dependencies import (
-        Dependency,
-        _Depends,
-        get_dependency_parameters,
-    )
-except ImportError:
-    from fastmcp._vendor.docket_di import (
-        Dependency,
-        _Depends,
-        get_dependency_parameters,
-    )
-
-# Import Progress separately to avoid breaking DI fallback if Progress is missing
+# Import Progress separately — it's docket-specific, not part of uncalled-for
 try:
     from docket.dependencies import Progress as DocketProgress
 except ImportError:
-    DocketProgress = None  # type: ignore[assignment]
+    DocketProgress = None  # type: ignore[assignment]  # ty:ignore[invalid-assignment]
 
 
 # --- Context utilities ---
@@ -167,11 +215,14 @@ def transform_context_annotations(fn: Callable[..., Any]) -> Callable[..., Any]:
 
     # First pass: identify which params need transformation
     params_to_transform: set[str] = set()
+    optional_context_params: set[str] = set()
     for name, param in sig.parameters.items():
         annotation = type_hints.get(name, param.annotation)
         if is_class_member_of_type(annotation, Context):
             if not isinstance(param.default, Dependency):
                 params_to_transform.add(name)
+                if param.default is None:
+                    optional_context_params.add(name)
 
     if not params_to_transform:
         return fn
@@ -197,7 +248,10 @@ def transform_context_annotations(fn: Callable[..., Any]) -> Callable[..., Any]:
             # We use CurrentContext() instead of Depends(get_context) because
             # get_context() returns the Context which is an AsyncContextManager,
             # and the DI system would try to enter it again (it's already entered)
-            param = param.replace(default=CurrentContext())
+            if name in optional_context_params:
+                param = param.replace(default=OptionalCurrentContext())
+            else:
+                param = param.replace(default=CurrentContext())
 
         # Sort into buckets based on parameter kind
         if param.kind == P.POSITIONAL_ONLY:
@@ -238,10 +292,10 @@ def transform_context_annotations(fn: Callable[..., Any]) -> Callable[..., Any]:
         # Insert 'self' at the beginning of our new params
         self_param = next(iter(func_sig.parameters.values()))  # Should be 'self'
         new_sig = func_sig.replace(parameters=[self_param, *new_params])
-        fn.__func__.__signature__ = new_sig  # type: ignore[union-attr]
+        fn.__func__.__signature__ = new_sig  # type: ignore[union-attr]  # ty:ignore[unresolved-attribute]
     else:
         new_sig = sig.replace(parameters=new_params)
-        fn.__signature__ = new_sig  # type: ignore[attr-defined]
+        fn.__signature__ = new_sig  # type: ignore[attr-defined]  # ty:ignore[invalid-assignment]
 
     # Clear caches that may have cached the old signature
     # This ensures get_dependency_parameters and without_injected_parameters
@@ -257,30 +311,14 @@ def _clear_signature_caches(fn: Callable[..., Any]) -> None:
     Called after modifying a function's signature to ensure downstream
     code sees the updated signature.
     """
-    # Clear vendored DI caches
-    from fastmcp._vendor.docket_di import _parameter_cache, _signature_cache
+    from uncalled_for.introspection import _parameter_cache, _signature_cache
 
     _signature_cache.pop(fn, None)
     _parameter_cache.pop(fn, None)
 
-    # Also clear for __func__ if it's a method
     if inspect.ismethod(fn):
         _signature_cache.pop(fn.__func__, None)
         _parameter_cache.pop(fn.__func__, None)
-
-    # Try to clear docket caches if docket is installed
-    if is_docket_available():
-        try:
-            from docket.dependencies import _parameter_cache as docket_param_cache
-            from docket.execution import _signature_cache as docket_sig_cache
-
-            docket_sig_cache.pop(fn, None)
-            docket_param_cache.pop(fn, None)
-            if inspect.ismethod(fn):
-                docket_sig_cache.pop(fn.__func__, None)
-                docket_param_cache.pop(fn.__func__, None)
-        except (ImportError, AttributeError):
-            pass  # Cache access not available in this docket version
 
 
 def get_context() -> Context:
@@ -296,12 +334,24 @@ def get_context() -> Context:
 def get_server() -> FastMCP:
     """Get the current FastMCP server instance directly.
 
+    In a background-task worker, checks the task-server map first so that
+    mounted-child tasks resolve to the child server (not the parent that
+    started the worker).
+
     Returns:
         The active FastMCP server
 
     Raises:
         RuntimeError: If no server in context
     """
+    # In a task context, prefer the task-specific server mapping.
+    # This handles mounted-child tasks where _current_server is the parent.
+    task_info = get_task_context()
+    if task_info is not None:
+        task_server = get_task_server(task_info.task_id)
+        if task_server is not None:
+            return task_server
+
     server_ref = _current_server.get()
     if server_ref is None:
         raise RuntimeError("No FastMCP server instance in context")
@@ -315,6 +365,8 @@ def get_http_request() -> Request:
     """Get the current HTTP request.
 
     Tries MCP SDK's request_ctx first, then falls back to FastMCP's HTTP context.
+    In background tasks, returns a synthetic request populated with the
+    snapshotted headers from the originating HTTP request.
     """
     # Try MCP SDK's request_ctx first (set during normal MCP request handling)
     request = None
@@ -326,19 +378,52 @@ def get_http_request() -> Request:
     if request is None:
         request = _current_http_request.get()
 
+    # In Docket workers, restore a minimal request from the snapshotted headers.
+    # Uses sync fallback chain: ContextVar → in-memory dict → sync Redis.
+    if request is None:
+        snapshot = _get_task_snapshot_sync()
+        task_headers = snapshot.http_headers if snapshot else None
+        if task_headers:
+            request = Request(
+                {
+                    "type": "http",
+                    "http_version": "1.1",
+                    "method": "POST",
+                    "scheme": "http",
+                    "path": "/",
+                    "raw_path": b"/",
+                    "query_string": b"",
+                    "headers": [
+                        (name.encode("latin-1"), value.encode("latin-1"))
+                        for name, value in task_headers.items()
+                    ],
+                    "client": None,
+                    "server": None,
+                    "root_path": "",
+                }
+            )
+
     if request is None:
         raise RuntimeError("No active HTTP request found.")
     return request
 
 
-def get_http_headers(include_all: bool = False) -> dict[str, str]:
+def get_http_headers(
+    include_all: bool = False,
+    include: set[str] | None = None,
+) -> dict[str, str]:
     """Extract headers from the current HTTP request if available.
 
     Never raises an exception, even if there is no active HTTP request (in which case
     an empty dict is returned).
 
-    By default, strips problematic headers like `content-length` that cause issues
-    if forwarded to downstream clients. If `include_all` is True, all headers are returned.
+    By default, strips problematic headers like `content-length` and `authorization`
+    that cause issues if forwarded to downstream services. If `include_all` is True,
+    all headers are returned.
+
+    The `include` parameter allows specific headers to be included even if they would
+    normally be excluded. This is useful for proxy transports that need to forward
+    authorization headers to upstream MCP servers.
     """
     if include_all:
         exclude_headers: set[str] = set()
@@ -346,6 +431,7 @@ def get_http_headers(include_all: bool = False) -> dict[str, str]:
         exclude_headers = {
             "host",
             "content-length",
+            "content-type",
             "connection",
             "transfer-encoding",
             "upgrade",
@@ -353,6 +439,7 @@ def get_http_headers(include_all: bool = False) -> dict[str, str]:
             "keep-alive",
             "expect",
             "accept",
+            "authorization",
             # Proxy-related headers
             "proxy-authenticate",
             "proxy-authorization",
@@ -360,7 +447,9 @@ def get_http_headers(include_all: bool = False) -> dict[str, str]:
             # MCP-related headers
             "mcp-session-id",
         }
-        # (just in case)
+        if include:
+            exclude_headers -= {h.lower() for h in include}
+        # Sanity check: all entries must already be lowercase
         if not all(h.lower() == h for h in exclude_headers):
             raise ValueError("Excluded headers must be lowercase")
     headers: dict[str, str] = {}
@@ -382,7 +471,8 @@ def get_access_token() -> AccessToken | None:
     This function first tries to get the token from the current HTTP request's scope,
     which is more reliable for long-lived connections where the SDK's auth_context_var
     may become stale after token refresh. Falls back to the SDK's context var if no
-    request is available.
+    request is available. In background tasks (Docket workers), falls back to the
+    token snapshot stored in Redis at task submission time.
 
     Returns:
         The access token if an authenticated user is available, None otherwise.
@@ -404,6 +494,18 @@ def get_access_token() -> AccessToken | None:
     # Fall back to SDK's context var if we didn't get a token from the request
     if access_token is None:
         access_token = _sdk_get_access_token()
+
+    # Fall back to background task snapshot (#3095)
+    # In Docket workers, neither HTTP request nor SDK context var are available.
+    # Uses sync fallback chain: ContextVar → in-memory dict → sync Redis.
+    if access_token is None:
+        snapshot = _get_task_snapshot_sync()
+        if snapshot is not None and snapshot.access_token_json is not None:
+            task_token = AccessToken.model_validate_json(snapshot.access_token_json)
+            if task_token.expires_at is not None:
+                if task_token.expires_at < int(datetime.now(timezone.utc).timestamp()):
+                    return None
+            return task_token
 
     if access_token is None or isinstance(access_token, AccessToken):
         return access_token
@@ -475,7 +577,7 @@ def without_injected_parameters(fn: Callable[..., Any]) -> Callable[..., Any]:
     new_sig = inspect.Signature(user_params)
 
     # Create async wrapper that handles dependency resolution
-    fn_is_async = inspect.iscoroutinefunction(fn)
+    fn_is_async = is_coroutine_function(fn)
 
     async def wrapper(**user_kwargs: Any) -> Any:
         async with resolve_dependencies(fn, user_kwargs) as resolved_kwargs:
@@ -489,15 +591,23 @@ def without_injected_parameters(fn: Callable[..., Any]) -> Callable[..., Any]:
                     result = await result
                 return result
 
-    # Set wrapper metadata (only parameter annotations, not return type)
-    wrapper.__signature__ = new_sig  # type: ignore[attr-defined]
+    # Resolve string annotations (from `from __future__ import annotations`) using
+    # the original function's module context. The wrapper's __globals__ points to
+    # this module (dependencies.py) and is read-only, so some Pydantic versions
+    # can't resolve names like Annotated or Literal from string annotations.
+    try:
+        resolved_hints = get_type_hints(fn, include_extras=True)
+    except Exception:
+        resolved_hints = getattr(fn, "__annotations__", {})
+
+    wrapper.__signature__ = new_sig  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
     wrapper.__annotations__ = {
-        k: v
-        for k, v in getattr(fn, "__annotations__", {}).items()
-        if k not in exclude and k != "return"
+        k: v for k, v in resolved_hints.items() if k not in exclude and k != "return"
     }
     wrapper.__name__ = getattr(fn, "__name__", "wrapper")
     wrapper.__doc__ = getattr(fn, "__doc__", None)
+    wrapper.__module__ = fn.__module__
+    wrapper.__qualname__ = getattr(fn, "__qualname__", wrapper.__qualname__)
 
     return wrapper
 
@@ -622,14 +732,100 @@ async def resolve_dependencies(
 # so that get_dependency_parameters can detect them.
 
 
-class _CurrentContext(Dependency):  # type: ignore[misc]
-    """Async context manager for Context dependency."""
+class _CurrentContext(Dependency["Context"]):
+    """Async context manager for Context dependency.
+
+    In foreground (request) mode: returns the active context from _current_context.
+    In background (Docket worker) mode: creates a task-aware Context with task_id
+    and loads the unified task snapshot from Redis.
+
+    The shared default instance is a stateless factory. All per-invocation
+    state lives on the returned Context or in task-local ContextVars, so
+    concurrent tasks never share mutable state.
+    """
 
     async def __aenter__(self) -> Context:
-        return get_context()
+        from fastmcp.server.context import Context, _current_context
 
-    async def __aexit__(self, *args: object) -> None:
-        pass
+        # Try foreground context first (normal MCP request)
+        context = _current_context.get()
+        if context is not None:
+            return context
+
+        # Check if we're in a Docket worker context
+        task_info = get_task_context()
+        if task_info is not None:
+            server = get_server()
+
+            # Load unified snapshot (sets _task_snapshot ContextVar)
+            snapshot = await _load_task_snapshot_async(
+                task_info.task_scope, task_info.task_id
+            )
+            origin_request_id = snapshot.origin_request_id if snapshot else None
+
+            # Session ID is stored in the snapshot for notification delivery
+            snapshot_session_id = snapshot.session_id if snapshot else None
+            session = (
+                get_task_session(snapshot_session_id) if snapshot_session_id else None
+            )
+
+            ctx = Context(
+                fastmcp=server,
+                session=session,
+                task_id=task_info.task_id,
+                origin_request_id=origin_request_id,
+            )
+            await ctx.__aenter__()
+            return ctx
+
+        raise RuntimeError(
+            "No active context found. This can happen if:\n"
+            "  - Called outside an MCP request handler\n"
+            "  - Called in a background task before session was registered\n"
+            "Check `context.request_context` for None before accessing."
+        )
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        from fastmcp.server.context import _current_context
+
+        ctx = _current_context.get()
+        if ctx is not None and ctx.is_background_task:
+            await ctx.__aexit__(exc_type, exc_value, traceback)
+
+
+class _OptionalCurrentContext(Dependency["Context | None"]):
+    """Context dependency that returns None instead of raising when no context
+    is active. Used for ``ctx: Context = None`` parameter patterns.
+
+    Delegates entirely to ``_CurrentContext`` — just catches the RuntimeError.
+    Cleanup is handled by ``_CurrentContext.__aexit__`` reading from the
+    task-local ContextVar.
+    """
+
+    async def __aenter__(self) -> Context | None:
+        try:
+            return await _CurrentContext().__aenter__()
+        except RuntimeError as exc:
+            if "No active context found" in str(exc):
+                return None
+            raise
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        from fastmcp.server.context import _current_context
+
+        ctx = _current_context.get()
+        if ctx is not None and ctx.is_background_task:
+            await _CurrentContext().__aexit__(exc_type, exc_value, traceback)
 
 
 def CurrentContext() -> Context:
@@ -657,12 +853,24 @@ def CurrentContext() -> Context:
     return cast("Context", _CurrentContext())
 
 
-class _CurrentDocket(Dependency):  # type: ignore[misc]
+def OptionalCurrentContext() -> Context | None:
+    """Get the current FastMCP Context, or None when no context is active."""
+    return cast("Context | None", _OptionalCurrentContext())
+
+
+class _CurrentDocket(Dependency["Docket"]):
     """Async context manager for Docket dependency."""
 
     async def __aenter__(self) -> Docket:
         require_docket("CurrentDocket()")
-        docket = _current_docket.get()
+        # Check server instance first, fall back to ContextVar for mounted children
+        # whose parent owns the Docket
+        try:
+            docket = get_server()._docket
+        except RuntimeError:
+            docket = None
+        if docket is None:
+            docket = _current_docket.get()
         if docket is None:
             raise RuntimeError(
                 "No Docket instance found. Docket is only initialized when there are "
@@ -671,7 +879,12 @@ class _CurrentDocket(Dependency):  # type: ignore[misc]
             )
         return docket
 
-    async def __aexit__(self, *args: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         pass
 
 
@@ -702,12 +915,18 @@ def CurrentDocket() -> Docket:
     return cast("Docket", _CurrentDocket())
 
 
-class _CurrentWorker(Dependency):  # type: ignore[misc]
+class _CurrentWorker(Dependency["Worker"]):
     """Async context manager for Worker dependency."""
 
     async def __aenter__(self) -> Worker:
         require_docket("CurrentWorker()")
-        worker = _current_worker.get()
+        # Check server instance first, fall back to ContextVar for mounted children
+        try:
+            worker = get_server()._worker
+        except RuntimeError:
+            worker = None
+        if worker is None:
+            worker = _current_worker.get()
         if worker is None:
             raise RuntimeError(
                 "No Worker instance found. Worker is only initialized when there are "
@@ -716,7 +935,12 @@ class _CurrentWorker(Dependency):  # type: ignore[misc]
             )
         return worker
 
-    async def __aexit__(self, *args: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         pass
 
 
@@ -746,19 +970,18 @@ def CurrentWorker() -> Worker:
     return cast("Worker", _CurrentWorker())
 
 
-class _CurrentFastMCP(Dependency):  # type: ignore[misc]
+class _CurrentFastMCP(Dependency["FastMCP"]):
     """Async context manager for FastMCP server dependency."""
 
     async def __aenter__(self) -> FastMCP:
-        server_ref = _current_server.get()
-        if server_ref is None:
-            raise RuntimeError("No FastMCP server instance in context")
-        server = server_ref()
-        if server is None:
-            raise RuntimeError("FastMCP server instance is no longer available")
-        return server
+        return get_server()
 
-    async def __aexit__(self, *args: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         pass
 
 
@@ -787,13 +1010,18 @@ def CurrentFastMCP() -> FastMCP:
     return cast(FastMCP, _CurrentFastMCP())
 
 
-class _CurrentRequest(Dependency):  # type: ignore[misc]
+class _CurrentRequest(Dependency[Request]):
     """Async context manager for HTTP Request dependency."""
 
     async def __aenter__(self) -> Request:
         return get_http_request()
 
-    async def __aexit__(self, *args: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         pass
 
 
@@ -823,22 +1051,28 @@ def CurrentRequest() -> Request:
     return cast(Request, _CurrentRequest())
 
 
-class _CurrentHeaders(Dependency):  # type: ignore[misc]
+class _CurrentHeaders(Dependency[dict[str, str]]):
     """Async context manager for HTTP Headers dependency."""
 
     async def __aenter__(self) -> dict[str, str]:
-        return get_http_headers()
+        return get_http_headers(include={"authorization"})
 
-    async def __aexit__(self, *args: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         pass
 
 
 def CurrentHeaders() -> dict[str, str]:
     """Get the current HTTP request headers.
 
-    This dependency provides access to the HTTP headers for the current request.
-    Returns an empty dictionary when no HTTP request is available, making it
-    safe to use in code that might run over any transport.
+    This dependency provides access to the HTTP headers for the current request,
+    including the authorization header. Returns an empty dictionary when no HTTP
+    request is available, making it safe to use in code that might run over any
+    transport.
 
     Returns:
         A dependency that resolves to a dictionary of header name -> value
@@ -854,47 +1088,6 @@ def CurrentHeaders() -> dict[str, str]:
         ```
     """
     return cast(dict[str, str], _CurrentHeaders())
-
-
-class _CurrentAccessToken(Dependency):  # type: ignore[misc]
-    """Async context manager for AccessToken dependency."""
-
-    async def __aenter__(self) -> AccessToken:
-        token = get_access_token()
-        if token is None:
-            raise RuntimeError(
-                "No access token found. Ensure authentication is configured "
-                "and the request is authenticated."
-            )
-        return token
-
-    async def __aexit__(self, *args: object) -> None:
-        pass
-
-
-def CurrentAccessToken() -> AccessToken:
-    """Get the current access token for the authenticated user.
-
-    This dependency provides access to the AccessToken for the current
-    authenticated request. Raises an error if no authentication is present.
-
-    Returns:
-        A dependency that resolves to the active AccessToken
-
-    Raises:
-        RuntimeError: If no authenticated user (use get_access_token() for optional)
-
-    Example:
-        ```python
-        from fastmcp.server.dependencies import CurrentAccessToken
-        from fastmcp.server.auth import AccessToken
-
-        @mcp.tool()
-        async def get_user_id(token: AccessToken = CurrentAccessToken()) -> str:
-            return token.claims.get("sub", "unknown")
-        ```
-    """
-    return cast(AccessToken, _CurrentAccessToken())
 
 
 # --- Progress dependency ---
@@ -952,7 +1145,12 @@ class InMemoryProgress:
     async def __aenter__(self) -> InMemoryProgress:
         return self
 
-    async def __aexit__(self, *args: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         pass
 
     @property
@@ -987,43 +1185,189 @@ class InMemoryProgress:
         self._message = message
 
 
-class Progress(Dependency):  # type: ignore[misc]
-    """FastMCP Progress dependency that works in both server and worker contexts.
+class Progress(Dependency["Progress"]):
+    """Progress dependency that works in both server and worker contexts.
 
-    Handles three execution modes:
-    - In Docket worker: Uses the execution's progress (observable via Redis)
-    - In FastMCP server with Docket: Falls back to in-memory progress
-    - In FastMCP server without Docket: Uses in-memory progress
+    In a Docket worker, delegates to the execution's Redis-backed progress
+    (observable across processes). Otherwise, uses in-memory tracking.
 
-    This allows tools to use Progress() regardless of whether they're called
-    immediately or as background tasks, and regardless of whether pydocket
-    is installed.
+    The shared default instance acts as a stateless factory — ``__aenter__``
+    creates a fresh ``Progress`` per invocation so concurrent tasks never
+    share mutable state.
     """
 
-    async def __aenter__(self) -> ProgressLike:
-        # Check if we're in a FastMCP server context
+    _impl: ProgressLike | None = None
+
+    async def __aenter__(self) -> Progress:
         server_ref = _current_server.get()
         if server_ref is None or server_ref() is None:
             raise RuntimeError("Progress dependency requires a FastMCP server context.")
 
-        # If pydocket is installed, try to use Docket's progress
-        if is_docket_available():
-            from docket.dependencies import Progress as DocketProgress
+        instance = Progress()
 
-            # Try to get execution from Docket worker context
+        if is_docket_available():
             try:
-                docket_progress = DocketProgress()
-                return await docket_progress.__aenter__()
+                from docket.dependencies import current_execution
+
+                instance._impl = current_execution.get().progress
+                return instance
             except LookupError:
-                # Not in worker context - fall through to in-memory progress
                 pass
 
-        # Return in-memory progress for immediate execution
-        # This is used when:
-        # 1. pydocket is not installed
-        # 2. Docket is not running (no task-enabled components)
-        # 3. In server context (not worker context)
-        return InMemoryProgress()
+        instance._impl = InMemoryProgress()
+        return instance
 
-    async def __aexit__(self, *args: object) -> None:
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
         pass
+
+    @property
+    def current(self) -> int | None:
+        """Current progress value."""
+        assert self._impl is not None, "Progress must be used as a dependency"
+        return self._impl.current
+
+    @property
+    def total(self) -> int:
+        """Total/target progress value."""
+        assert self._impl is not None, "Progress must be used as a dependency"
+        return self._impl.total
+
+    @property
+    def message(self) -> str | None:
+        """Current progress message."""
+        assert self._impl is not None, "Progress must be used as a dependency"
+        return self._impl.message
+
+    async def set_total(self, total: int) -> None:
+        """Set the total/target value for progress tracking."""
+        assert self._impl is not None, "Progress must be used as a dependency"
+        await self._impl.set_total(total)
+
+    async def increment(self, amount: int = 1) -> None:
+        """Atomically increment the current progress value."""
+        assert self._impl is not None, "Progress must be used as a dependency"
+        await self._impl.increment(amount)
+
+    async def set_message(self, message: str | None) -> None:
+        """Update the progress status message."""
+        assert self._impl is not None, "Progress must be used as a dependency"
+        await self._impl.set_message(message)
+
+
+# --- Access Token dependency ---
+
+
+class _CurrentAccessToken(Dependency[AccessToken]):
+    """Async context manager for AccessToken dependency."""
+
+    async def __aenter__(self) -> AccessToken:
+        token = get_access_token()
+
+        if token is None:
+            raise RuntimeError(
+                "No access token found. Ensure authentication is configured "
+                "and the request is authenticated."
+            )
+        return token
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        pass
+
+
+def CurrentAccessToken() -> AccessToken:
+    """Get the current access token for the authenticated user.
+
+    This dependency provides access to the AccessToken for the current
+    authenticated request. Raises an error if no authentication is present.
+
+    Returns:
+        A dependency that resolves to the active AccessToken
+
+    Raises:
+        RuntimeError: If no authenticated user (use get_access_token() for optional)
+
+    Example:
+        ```python
+        from fastmcp.server.dependencies import CurrentAccessToken
+        from fastmcp.server.auth import AccessToken
+
+        @mcp.tool()
+        async def get_user_id(token: AccessToken = CurrentAccessToken()) -> str:
+            return token.claims.get("sub", "unknown")
+        ```
+    """
+    return cast(AccessToken, _CurrentAccessToken())
+
+
+# --- Token Claim dependency ---
+
+
+class _TokenClaim(Dependency[str]):
+    """Dependency that extracts a specific claim from the access token."""
+
+    def __init__(self, claim_name: str):
+        self.claim_name = claim_name
+
+    async def __aenter__(self) -> str:
+        token = get_access_token()
+        if token is None:
+            raise RuntimeError(
+                f"No access token available. Cannot extract claim '{self.claim_name}'."
+            )
+        value = token.claims.get(self.claim_name)
+        if value is None:
+            raise RuntimeError(
+                f"Claim '{self.claim_name}' not found in access token. "
+                f"Available claims: {list(token.claims.keys())}"
+            )
+        return str(value)
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        pass
+
+
+def TokenClaim(name: str) -> str:
+    """Get a specific claim from the access token.
+
+    This dependency extracts a single claim value from the current access token.
+    It's useful for getting user identifiers, roles, or other token claims
+    without needing the full token object.
+
+    Args:
+        name: The name of the claim to extract (e.g., "oid", "sub", "email")
+
+    Returns:
+        A dependency that resolves to the claim value as a string
+
+    Raises:
+        RuntimeError: If no access token is available or claim is missing
+
+    Example:
+        ```python
+        from fastmcp.server.dependencies import TokenClaim
+
+        @mcp.tool()
+        async def add_expense(
+            user_id: str = TokenClaim("oid"),  # Azure object ID
+            amount: float,
+        ):
+            # user_id is automatically injected from the token
+            await db.insert({"user_id": user_id, "amount": amount})
+        ```
+    """
+    return cast(str, _TokenClaim(name))

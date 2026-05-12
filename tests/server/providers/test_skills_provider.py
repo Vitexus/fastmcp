@@ -169,6 +169,28 @@ This is my skill content.
             assert "reference.md" in paths
             assert "scripts/helper.py" in paths
 
+    async def test_manifest_ignores_symlink_target_outside_skill(self, tmp_path: Path):
+        skill_dir = tmp_path / "symlinked-skill"
+        skill_dir.mkdir()
+        (skill_dir / "SKILL.md").write_text("# Skill\n")
+
+        outside_file = tmp_path / "outside.txt"
+        outside_file.write_text("secret")
+        (skill_dir / "leak.txt").symlink_to(outside_file)
+
+        mcp = FastMCP("Test")
+        mcp.add_provider(SkillProvider(skill_path=skill_dir))
+
+        async with Client(mcp) as client:
+            result = await client.read_resource(
+                AnyUrl("skill://symlinked-skill/_manifest")
+            )
+            manifest = json.loads(result[0].text)
+
+        paths = {f["path"] for f in manifest["files"]}
+        assert "SKILL.md" in paths
+        assert "leak.txt" not in paths
+
     async def test_read_supporting_file_via_template(self, single_skill_dir: Path):
         mcp = FastMCP("Test")
         mcp.add_provider(SkillProvider(skill_path=single_skill_dir))
@@ -186,6 +208,59 @@ This is my skill content.
         async with Client(mcp) as client:
             result = await client.read_resource(AnyUrl("skill://my-skill/reference.md"))
             assert "# Reference" in result[0].text
+
+    async def test_skill_resource_meta(self, single_skill_dir: Path):
+        """SkillResource populates meta with skill name and is_manifest."""
+        provider = SkillProvider(skill_path=single_skill_dir)
+        resources = await provider.list_resources()
+
+        by_name = {r.name: r for r in resources}
+
+        main_meta = by_name["my-skill/SKILL.md"].get_meta()
+        assert main_meta["fastmcp"]["skill"] == {
+            "name": "my-skill",
+            "is_manifest": False,
+        }
+
+        manifest_meta = by_name["my-skill/_manifest"].get_meta()
+        assert manifest_meta["fastmcp"]["skill"] == {
+            "name": "my-skill",
+            "is_manifest": True,
+        }
+
+    async def test_skill_file_resource_meta(self, single_skill_dir: Path):
+        """SkillFileResource populates meta with skill name."""
+        provider = SkillProvider(
+            skill_path=single_skill_dir, supporting_files="resources"
+        )
+        resources = await provider.list_resources()
+
+        by_name = {r.name: r for r in resources}
+        file_meta = by_name["my-skill/reference.md"].get_meta()
+        assert file_meta["fastmcp"]["skill"] == {"name": "my-skill"}
+
+    async def test_skill_meta_survives_mounting(self, single_skill_dir: Path):
+        """Skill metadata in _meta is preserved when accessed through a mounted server."""
+        child = FastMCP("child")
+        child.add_provider(SkillProvider(skill_path=single_skill_dir))
+
+        parent = FastMCP("parent")
+        parent.mount(child, "skills")
+
+        resources = await parent.list_resources()
+        by_name = {r.name: r for r in resources}
+
+        main_meta = by_name["my-skill/SKILL.md"].get_meta()
+        assert main_meta["fastmcp"]["skill"] == {
+            "name": "my-skill",
+            "is_manifest": False,
+        }
+
+        manifest_meta = by_name["my-skill/_manifest"].get_meta()
+        assert manifest_meta["fastmcp"]["skill"] == {
+            "name": "my-skill",
+            "is_manifest": True,
+        }
 
 
 class TestSkillsDirectoryProvider:
@@ -578,14 +653,8 @@ class TestPathTraversalPrevention:
         mcp.add_provider(SkillsDirectoryProvider(roots=skills_dir))
 
         async with Client(mcp) as client:
-            # Path traversal attempts should fail (either normalized away or blocked)
-            # The important thing is that SECRET DATA is never returned
+            # Path traversal attempts should fail — the secret must never be returned
             with pytest.raises(Exception):
-                result = await client.read_resource(
+                await client.read_resource(
                     AnyUrl("skill://test-skill/../../../secret.txt")
                 )
-                # If we somehow got here, ensure we didn't get the secret
-                if result:
-                    for content in result:
-                        if hasattr(content, "text"):
-                            assert "SECRET DATA" not in content.text

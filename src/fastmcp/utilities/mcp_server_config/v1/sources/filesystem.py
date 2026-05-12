@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from pydantic import Field, field_validator
 
+from fastmcp.utilities.async_utils import is_coroutine_function
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.mcp_server_config.v1.sources.base import Source
 
@@ -99,9 +100,9 @@ class FileSystemSource(Source):
             logger.error("Could not load module", extra={"file": str(file_path)})
             sys.exit(1)
 
-        module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
+        module = importlib.util.module_from_spec(spec)
         sys.modules["server_module"] = module  # Register in sys.modules
-        spec.loader.exec_module(module)  # type: ignore[union-attr]
+        spec.loader.exec_module(module)
 
         return module
 
@@ -182,11 +183,11 @@ class FileSystemSource(Source):
         from fastmcp.server.server import FastMCP
 
         # Check if it's a function or coroutine function
-        if inspect.isfunction(obj) or inspect.iscoroutinefunction(obj):
+        if inspect.isfunction(obj) or is_coroutine_function(obj):
             logger.debug(f"Found factory function '{name}' in {file_path}")
 
             try:
-                if inspect.iscoroutinefunction(obj):
+                if is_coroutine_function(obj):
                     # Async factory function
                     server = await obj()
                 else:

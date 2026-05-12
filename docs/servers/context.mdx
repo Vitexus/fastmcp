@@ -238,13 +238,31 @@ async def get_counter(ctx: Context) -> int:
 Each client session has its own isolated state—two different clients calling `increment_counter` will each have their own counter.
 
 **Method signatures:**
-- **`await ctx.set_state(key: str, value: Any) -> None`**: Store a value in session state
-- **`await ctx.get_state(key: str) -> Any`**: Retrieve a value (returns None if not found)
-- **`await ctx.delete_state(key: str) -> None`**: Remove a value from session state
+- **`await ctx.set_state(key, value, *, serializable=True)`**: Store a value in session state
+- **`await ctx.get_state(key)`**: Retrieve a value (returns None if not found)
+- **`await ctx.delete_state(key)`**: Remove a value from session state
 
 <Note>
 State methods are async and require `await`. State expires after 1 day to prevent unbounded memory growth.
 </Note>
+
+#### Non-Serializable Values
+
+By default, state values must be JSON-serializable (dicts, lists, strings, numbers, etc.) so they can be persisted across requests. For non-serializable values like HTTP clients or database connections, pass `serializable=False`:
+
+```python
+@mcp.tool
+async def my_tool(ctx: Context) -> str:
+    # This object can't be JSON-serialized
+    client = SomeHTTPClient(base_url="https://api.example.com")
+    await ctx.set_state("client", client, serializable=False)
+
+    # Retrieve it later in the same request
+    client = await ctx.get_state("client")
+    return await client.fetch("/data")
+```
+
+Values stored with `serializable=False` only live for the current MCP request (a single tool call, resource read, or prompt render). They will not be available in subsequent requests within the session.
 
 #### Custom Storage Backends
 
@@ -258,6 +276,43 @@ mcp = FastMCP("distributed-app", session_state_store=RedisStore(...))
 ```
 
 Any backend compatible with the [py-key-value-aio](https://github.com/strawgate/py-key-value) `AsyncKeyValue` protocol works. See [Storage Backends](/servers/storage-backends) for more options including Redis, DynamoDB, and MongoDB.
+
+#### State and Mounted Servers
+
+Each `FastMCP` instance has its own session state store. When you `mount()` a child server, state set on the parent is not visible to tools on the child, and vice versa:
+
+```python
+from fastmcp import FastMCP, Context
+from fastmcp.server.middleware import Middleware, MiddlewareContext
+
+parent = FastMCP("Parent")
+child = FastMCP("Child")
+parent.mount(child, namespace="child")
+
+class Stasher(Middleware):
+    async def on_call_tool(self, context: MiddlewareContext, call_next):
+        await context.fastmcp_context.set_state("user", "alice")
+        return await call_next(context)
+
+parent.add_middleware(Stasher())
+
+@child.tool
+async def whoami(ctx: Context) -> str:
+    return await ctx.get_state("user") or "unknown"  # returns "unknown"
+```
+
+To share state across the mount boundary, pass the same store to both servers:
+
+```python
+from key_value.aio.stores.memory import MemoryStore
+
+store = MemoryStore()
+parent = FastMCP("Parent", session_state_store=store)
+child = FastMCP("Child", session_state_store=store)
+parent.mount(child, namespace="child")
+```
+
+Alternatively, state set with `serializable=False` lives on the request context and is inherited by mounted children automatically — use it when the value is request-scoped and does not need to persist across tool calls.
 
 #### State During Initialization
 

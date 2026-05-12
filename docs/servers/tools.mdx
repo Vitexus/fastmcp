@@ -36,7 +36,7 @@ def add(a: int, b: int) -> int:
 
 When this tool is registered, FastMCP automatically:
 - Uses the function name (`add`) as the tool name.
-- Uses the function's docstring (`Adds two integer numbers...`) as the tool description.
+- Parses the function's docstring for the tool description and, if present, per-parameter descriptions (see [Docstring Descriptions](#docstring-descriptions)).
 - Generates an input schema based on the function's parameters and type annotations.
 - Handles parameter validation and error reporting.
 
@@ -70,7 +70,7 @@ def search_products_implementation(query: str, category: str | None = None) -> l
 </ParamField>
 
 <ParamField body="description" type="str | None">
-  Provides the description exposed via MCP. If set, the function's docstring is ignored for this purpose
+  Provides the description exposed via MCP. If set, the function's docstring is ignored for the tool description, though docstring-derived parameter descriptions still apply (see [Docstring Descriptions](#docstring-descriptions)).
 </ParamField>
 
 <ParamField body="tags" type="set[str] | None">
@@ -126,6 +126,12 @@ def search_products_implementation(query: str, category: str | None = None) -> l
 
   Optional version identifier for this tool. See [Versioning](/servers/versioning) for details.
 </ParamField>
+
+<ParamField body="output_schema" type="dict[str, Any] | None">
+  <VersionBadge version="2.10.0" />
+
+  Optional JSON schema for the tool's output. When provided, the tool must return structured output matching this schema. If not provided, FastMCP automatically generates a schema from the function's return type annotation. See [Output Schemas](#output-schemas) for details.
+</ParamField>
 </Card>
 
 ### Using with Methods
@@ -175,6 +181,12 @@ By default, FastMCP converts Python functions into MCP tools by inspecting the f
 
 <Note>
 FastMCP automatically dereferences `$ref` entries in tool schemas to ensure compatibility with MCP clients that don't fully support JSON Schema references (e.g., VS Code Copilot, Claude Desktop). This means complex Pydantic models with shared types are inlined in the schema rather than using `$defs` references.
+
+Dereferencing happens at serve-time via middleware, so your schemas are stored with `$ref` intact and only inlined when sent to clients. If you know your clients handle `$ref` correctly and prefer smaller schemas, you can opt out:
+
+```python
+mcp = FastMCP("my-server", dereference_schemas=False)
+```
 </Note>
 
 ### Type Annotations
@@ -276,6 +288,33 @@ The default flexible validation mode is recommended for most use cases as it han
 ### Parameter Metadata
 
 You can provide additional metadata about parameters in several ways:
+
+#### Docstring Descriptions
+
+<VersionBadge version="3.2.4" />
+
+FastMCP parses your function's docstring to extract both the tool description and per-parameter descriptions. Google, NumPy, and Sphinx docstring styles are all supported — the parser tries each and uses whichever finds parameter descriptions:
+
+```python
+@mcp.tool
+def process_image(
+    image_url: str,
+    resize: bool = False,
+    width: int = 800,
+) -> dict:
+    """Process an image with optional resizing.
+
+    Args:
+        image_url: URL of the image to process.
+        resize: Whether to resize the image.
+        width: Target width in pixels.
+    """
+    # Implementation...
+```
+
+The free-form text above the `Args` section — whether a single line or multiple paragraphs — becomes the tool description, and each parameter's docstring entry becomes the description for that parameter in the generated schema. Sections like `Returns`, `Raises`, and `Example` are excluded from the description but otherwise ignored.
+
+If a parameter already has an explicit description — via `Annotated[x, "..."]` or `Field(description=...)` — that description takes precedence over the docstring. This makes it safe to adopt docstring-based descriptions incrementally: existing annotations keep working, and docstrings fill in the gaps.
 
 #### Simple String Descriptions
 
@@ -738,7 +777,7 @@ def get_config() -> ToolResult:
 ```
 
 <Tip>
-For reusable serialization across multiple tools, create a wrapper decorator that returns `ToolResult`. This lets you compose serializers with other behaviors (logging, validation, caching) and keeps the serialization visible at the tool definition. See [examples/custom_tool_serializer_decorator.py](https://github.com/jlowin/fastmcp/blob/main/examples/custom_tool_serializer_decorator.py) for a complete implementation.
+For reusable serialization across multiple tools, create a wrapper decorator that returns `ToolResult`. This lets you compose serializers with other behaviors (logging, validation, caching) and keeps the serialization visible at the tool definition. See [examples/custom_tool_serializer_decorator.py](https://github.com/PrefectHQ/fastmcp/blob/main/examples/custom_tool_serializer_decorator.py) for a complete implementation.
 </Tip>
 
 ## Error Handling
@@ -969,7 +1008,7 @@ def example_tool() -> str:
 mcp.add_tool(example_tool)              # Sends tools/list_changed notification
 mcp.disable(keys={"tool:example_tool"}) # Sends tools/list_changed notification
 mcp.enable(keys={"tool:example_tool"})  # Sends tools/list_changed notification
-mcp.remove_tool("example_tool")         # Sends tools/list_changed notification
+mcp.local_provider.remove_tool("example_tool")  # Sends tools/list_changed notification
 ```
 
 Notifications are only sent when these operations occur within an active MCP request context (e.g., when called from within a tool or other MCP operation). Operations performed during server initialization do not trigger notifications.
@@ -1054,7 +1093,7 @@ The duplicate behavior options are:
 
 <VersionBadge version="2.3.4" />
 
-You can dynamically remove tools from a server using the `remove_tool` method:
+You can dynamically remove tools from a server through its [local provider](/servers/providers/local):
 
 ```python
 from fastmcp import FastMCP
@@ -1066,7 +1105,7 @@ def calculate_sum(a: int, b: int) -> int:
     """Add two numbers together."""
     return a + b
 
-mcp.remove_tool("calculate_sum")
+mcp.local_provider.remove_tool("calculate_sum")
 ```
 
 ## Versioning

@@ -5,6 +5,7 @@ import logging
 import os
 import sys
 import tempfile
+import time
 from collections.abc import AsyncGenerator
 from datetime import timedelta
 from pathlib import Path
@@ -35,14 +36,18 @@ from fastmcp.mcp_config import (
     StdioMCPServer,
     TransformingStdioMCPServer,
 )
-from fastmcp.tools.tool import Tool as FastMCPTool
+from fastmcp.tools.base import Tool as FastMCPTool
 
-# Skip all tests in this file on Windows - they spawn subprocess servers via stdio
-# which has process lifecycle issues on Windows
-pytestmark = pytest.mark.skipif(
-    sys.platform.startswith("win32"),
-    reason="Windows has process lifecycle issues with stdio subprocesses",
-)
+# These tests spawn subprocess servers via stdio which can be slow under
+# parallel CI load. Give them more headroom than the 5s default, and skip
+# entirely on Windows due to process lifecycle issues.
+pytestmark = [
+    pytest.mark.timeout(15),
+    pytest.mark.skipif(
+        sys.platform.startswith("win32"),
+        reason="Windows has process lifecycle issues with stdio subprocesses",
+    ),
+]
 
 
 def running_under_debugger():
@@ -150,6 +155,11 @@ def test_parse_mcpservers_discriminator():
             "args": ["hello"],
         },
         "test_server_two": {"command": "echo", "args": ["hello"], "tools": {}},
+        "test_server_three": {
+            "command": "echo",
+            "args": ["hello"],
+            "include_tags": ["my_tag"],
+        },
     }
 
     mcp_config = MCPConfig.from_dict(config)
@@ -157,8 +167,13 @@ def test_parse_mcpservers_discriminator():
     test_server: MCPServerTypes = mcp_config.mcpServers["test_server"]
     assert isinstance(test_server, StdioMCPServer)
 
+    # Empty tools dict with no tags is not a meaningful transform
     test_server_two: MCPServerTypes = mcp_config.mcpServers["test_server_two"]
-    assert isinstance(test_server_two, TransformingStdioMCPServer)
+    assert isinstance(test_server_two, StdioMCPServer)
+
+    # include_tags alone triggers transforming type
+    test_server_three: MCPServerTypes = mcp_config.mcpServers["test_server_three"]
+    assert isinstance(test_server_three, TransformingStdioMCPServer)
 
     canonical_mcp_config = CanonicalMCPConfig.from_dict(config)
 
@@ -326,14 +341,29 @@ async def test_multi_client_parallel_calls(tmp_path: Path):
         exceptions = [result for result in results if isinstance(result, Exception)]
         assert len(exceptions) == 0
         assert len(results) == 40
-        assert all(len(result) == 2 for result in results)  # type: ignore[arg-type]
+        assert all(len(result) == 2 for result in results)  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+
+
+async def _wait_for_process_exit(pid: int, timeout: float = 3.0) -> None:
+    """Poll until a process has exited, raising if it's still alive after timeout."""
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            psutil.Process(pid)
+        except psutil.NoSuchProcess:
+            return
+        await asyncio.sleep(0.05)
+    # Final check — if still alive, let the NoSuchProcess propagation fail the test clearly
+    psutil.Process(pid)
+    pytest.fail(f"Process {pid} still alive after {timeout}s")
 
 
 @pytest.mark.skipif(
     running_under_debugger(),
     reason="Debugger holds a reference to the transport",
 )
-@pytest.mark.timeout(5)
+@pytest.mark.timeout(15)
 async def test_multi_client_lifespan(tmp_path: Path):
     pid_1: int | None = None
     pid_2: int | None = None
@@ -383,18 +413,13 @@ async def test_multi_client_lifespan(tmp_path: Path):
     gc_collect_harder()
 
     # This test will fail while debugging because the debugger holds a reference to the underlying transport
-
-    with pytest.raises(psutil.NoSuchProcess):
-        while True:
-            psutil.Process(pid_1)
-            await asyncio.sleep(0.01)
-
-    with pytest.raises(psutil.NoSuchProcess):
-        while True:
-            psutil.Process(pid_2)
-            await asyncio.sleep(0.01)
+    assert pid_1 is not None
+    assert pid_2 is not None
+    await _wait_for_process_exit(pid_1)
+    await _wait_for_process_exit(pid_2)
 
 
+@pytest.mark.timeout(15)
 async def test_multi_client_force_close(tmp_path: Path):
     server_script = inspect.cleandoc("""
         from fastmcp import FastMCP
@@ -436,15 +461,8 @@ async def test_multi_client_force_close(tmp_path: Path):
 
     gc_collect_harder()
 
-    with pytest.raises(psutil.NoSuchProcess):
-        process = psutil.Process(pid_1)
-
-        assert not process
-
-    with pytest.raises(psutil.NoSuchProcess):
-        process = psutil.Process(pid_2)
-
-        assert not process
+    await _wait_for_process_exit(pid_1)
+    await _wait_for_process_exit(pid_2)
 
 
 async def test_remote_config_default_no_auth():
@@ -664,7 +682,7 @@ async def test_canonical_multi_client_with_transforms(tmp_path: Path):
                 "command": "python",
                 "args": [str(script_path)],
             },
-        }  # type: ignore[reportUnknownArgumentType]
+        }  # type: ignore[reportUnknownArgumentType]  # ty:ignore[invalid-argument-type]
     )
 
     client = Client(config)
@@ -738,6 +756,48 @@ async def test_multi_client_transform_with_filtering(tmp_path: Path):
         assert "test_2_subtract" in tools_by_name
 
 
+@pytest.mark.flaky(retries=3)
+async def test_single_server_config_include_tags_filtering(tmp_path: Path):
+    """include_tags should filter tools even with a single server in the config."""
+    server_script = inspect.cleandoc("""
+        from fastmcp import FastMCP
+
+        mcp = FastMCP()
+
+        @mcp.tool(tags={"keep"})
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        @mcp.tool
+        def subtract(a: int, b: int) -> int:
+            return a - b
+
+        if __name__ == '__main__':
+            mcp.run()
+        """)
+
+    script_path = tmp_path / "test.py"
+    script_path.write_text(server_script)
+
+    config = {
+        "mcpServers": {
+            "test": {
+                "command": "python",
+                "args": [str(script_path)],
+                "include_tags": ["keep"],
+            },
+        }
+    }
+
+    client = Client(config)
+
+    async with client:
+        tools = await client.list_tools()
+        tool_names = {tool.name for tool in tools}
+        assert "add" in tool_names
+        assert "subtract" not in tool_names
+
+
 async def test_multi_client_with_elicitation(tmp_path: Path):
     """
     Tests that elicitation is properly forwarded to the ultimate client.
@@ -784,7 +844,7 @@ async def test_multi_server_config_transport(tmp_path: Path):
     """
     Tests that MCPConfigTransport properly handles multi-server configurations.
 
-    Related to https://github.com/jlowin/fastmcp/issues/2802 - verifies the
+    Related to https://github.com/PrefectHQ/fastmcp/issues/2802 - verifies the
     refactored architecture creates composite servers correctly.
     """
     server_script = inspect.cleandoc("""
@@ -850,37 +910,83 @@ async def test_multi_server_timeout_propagation():
     transport = MCPConfigTransport(config)
     timeout = timedelta(seconds=42)
 
-    # Patch _create_proxy to verify timeout is passed correctly
+    # Mock _create_proxy to avoid real stdio connections and verify timeout
+    mock_create_proxy = AsyncMock(
+        return_value=(AsyncMock(), AsyncMock(), FastMCP(name="MockProxy"))
+    )
+
     with (
-        patch("fastmcp.client.transports.FastMCP.as_proxy") as mock_as_proxy,
-        patch.object(
-            transport, "_create_proxy", wraps=transport._create_proxy
-        ) as mock_create_proxy,
-    ):
-        # Make as_proxy return a mock FastMCP
-        mock_proxy = FastMCP(name="MockProxy")
-        mock_as_proxy.return_value = mock_proxy
-
-        # Mock connect_session on FastMCPTransport to avoid actual connection
-        with patch(
+        patch.object(transport, "_create_proxy", mock_create_proxy),
+        patch(
             "fastmcp.client.transports.FastMCPTransport.connect_session"
-        ) as mock_connect:
-            mock_session = AsyncMock()
-            mock_connect.return_value.__aenter__ = AsyncMock(return_value=mock_session)
-            mock_connect.return_value.__aexit__ = AsyncMock(return_value=None)
+        ) as mock_connect,
+    ):
+        mock_session = AsyncMock()
+        mock_connect.return_value.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_connect.return_value.__aexit__ = AsyncMock(return_value=None)
 
-            async with transport.connect_session(read_timeout_seconds=timeout):
-                pass
+        async with transport.connect_session(read_timeout_seconds=timeout):
+            pass
 
-        # Verify _create_proxy was called with the timeout for each server
-        assert mock_create_proxy.call_count == 2
-        for call in mock_create_proxy.call_args_list:
-            _, kwargs = call.args, call.kwargs if call.kwargs else {}
-            # Third positional arg is timeout
-            call_timeout = call[0][2] if len(call[0]) > 2 else kwargs.get("timeout")
-            assert call_timeout == timeout, (
-                f"Expected timeout {timeout}, got {call_timeout}"
-            )
+    # Verify _create_proxy was called with the timeout for each server
+    assert mock_create_proxy.call_count == 2
+    for call in mock_create_proxy.call_args_list:
+        # Third positional arg is timeout
+        call_timeout = call[0][2] if len(call[0]) > 2 else call.kwargs.get("timeout")
+        assert call_timeout == timeout, (
+            f"Expected timeout {timeout}, got {call_timeout}"
+        )
+
+
+async def test_multi_server_session_persistence(tmp_path: Path):
+    """Test that session IDs persist across tool calls in multi-server mode.
+
+    Regression test for https://github.com/PrefectHQ/fastmcp/issues/2790 —
+    MCPConfigTransport was not connecting ProxyClients before mounting, so
+    each tool call opened a new session with the backend server.
+    """
+    server_script = inspect.cleandoc("""
+        from fastmcp import FastMCP, Context
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def get_session(ctx: Context) -> str:
+            return ctx.session_id
+
+        if __name__ == '__main__':
+            mcp.run()
+        """)
+
+    script_path = tmp_path / "session_server.py"
+    script_path.write_text(server_script)
+
+    config = {
+        "mcpServers": {
+            "server1": {
+                "command": "python",
+                "args": [str(script_path)],
+            },
+            "server2": {
+                "command": "python",
+                "args": [str(script_path)],
+            },
+        }
+    }
+
+    client = Client(config)
+    async with client:
+        result1 = await client.call_tool("server1_get_session", {})
+        assert isinstance(result1.content[0], TextContent)
+        session_id_1 = result1.content[0].text
+
+        result2 = await client.call_tool("server1_get_session", {})
+        assert isinstance(result2.content[0], TextContent)
+        session_id_2 = result2.content[0].text
+
+        assert session_id_1 == session_id_2, (
+            f"Session ID changed between calls: {session_id_1} != {session_id_2}"
+        )
 
 
 async def test_single_server_config_transport():
@@ -899,6 +1005,153 @@ async def test_single_server_config_transport():
 
     # _transports should already contain the single transport
     assert len(transport._transports) == 1
+
+
+@pytest.mark.parametrize(
+    "server_order",
+    [
+        {"good_server": True, "bad_server": False},
+        {"bad_server": False, "good_server": True},
+    ],
+    ids=["good_first", "bad_first"],
+)
+async def test_multi_server_partial_failure(tmp_path: Path, server_order: dict):
+    """When one server fails to connect, the others should still work."""
+    server_script = inspect.cleandoc("""
+        from fastmcp import FastMCP
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        if __name__ == '__main__':
+            mcp.run()
+        """)
+
+    script_path = tmp_path / "test.py"
+    script_path.write_text(server_script)
+
+    servers = {}
+    for name, is_good in server_order.items():
+        if is_good:
+            servers[name] = {
+                "command": "python",
+                "args": [str(script_path)],
+            }
+        else:
+            servers[name] = {
+                "command": "this-command-does-not-exist-anywhere",
+                "args": [],
+            }
+
+    client = Client({"mcpServers": servers})
+    async with client:
+        tools = await client.list_tools()
+        tool_names = [t.name for t in tools]
+        assert "good_server_add" in tool_names
+        assert len(tools) == 1
+
+
+async def test_multi_server_partial_failure_logs_warning(tmp_path: Path, caplog):
+    """A warning should be logged when a server fails to connect."""
+    server_script = inspect.cleandoc("""
+        from fastmcp import FastMCP
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def add(a: int, b: int) -> int:
+            return a + b
+
+        if __name__ == '__main__':
+            mcp.run()
+        """)
+
+    script_path = tmp_path / "test.py"
+    script_path.write_text(server_script)
+
+    config = {
+        "mcpServers": {
+            "good_server": {
+                "command": "python",
+                "args": [str(script_path)],
+            },
+            "bad_server": {
+                "command": "this-command-does-not-exist-anywhere",
+                "args": [],
+            },
+        }
+    }
+
+    with caplog.at_level(logging.WARNING):
+        async with Client(config):
+            pass
+
+    warning_records = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.WARNING and "bad_server" in r.message
+    ]
+    assert len(warning_records) == 1
+
+
+async def test_multi_server_all_fail():
+    """When all servers fail to connect, a ConnectionError should be raised."""
+    config = MCPConfig(
+        mcpServers={
+            "bad_1": StdioMCPServer(
+                command="this-command-does-not-exist-anywhere",
+                args=[],
+            ),
+            "bad_2": StdioMCPServer(
+                command="this-other-command-does-not-exist-either",
+                args=[],
+            ),
+        }
+    )
+
+    transport = MCPConfigTransport(config)
+    with pytest.raises(ConnectionError, match="All MCP servers failed to connect"):
+        async with transport.connect_session():
+            pass
+
+
+async def test_multi_server_partial_failure_cleanup(tmp_path: Path):
+    """Transports for failed servers should not leak into _transports."""
+    server_script = inspect.cleandoc("""
+        from fastmcp import FastMCP
+
+        mcp = FastMCP()
+
+        @mcp.tool
+        def ping() -> str:
+            return "pong"
+
+        if __name__ == '__main__':
+            mcp.run()
+        """)
+
+    script_path = tmp_path / "test.py"
+    script_path.write_text(server_script)
+
+    config = {
+        "mcpServers": {
+            "working": {
+                "command": "python",
+                "args": [str(script_path)],
+            },
+            "broken": {
+                "command": "this-command-does-not-exist-anywhere",
+                "args": [],
+            },
+        }
+    }
+
+    transport = MCPConfigTransport(config)
+    async with transport.connect_session():
+        assert len(transport._transports) == 1
 
 
 def sample_tool_fn(arg1: int, arg2: str) -> str:

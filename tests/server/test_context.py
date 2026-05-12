@@ -37,7 +37,7 @@ class TestParseModelPreferences:
 
     def test_parse_model_preferences_invalid_type(self, context):
         with pytest.raises(ValueError):
-            _parse_model_preferences(model_preferences=123)  # pyright: ignore[reportArgumentType] # type: ignore[invalid-argument-type]
+            _parse_model_preferences(model_preferences=123)  # pyright: ignore[reportArgumentType] # type: ignore[invalid-argument-type]  # ty:ignore[invalid-argument-type]
 
 
 class TestSessionId:
@@ -240,6 +240,97 @@ class TestContextState:
             # New session, so existing value is None
             assert data3["existing_value"] is None
             assert data3["session_id"] != session_id_1  # Different session
+
+
+class TestContextStateSerializable:
+    """Tests for the serializable parameter on set_state."""
+
+    async def test_set_state_serializable_false_stores_arbitrary_objects(self):
+        """Non-serializable objects can be stored with serializable=False."""
+        server = FastMCP("test")
+        mock_session = MagicMock()
+
+        class MyClient:
+            def __init__(self):
+                self.connected = True
+
+        client = MyClient()
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            await context.set_state("client", client, serializable=False)
+            result = await context.get_state("client")
+            assert result is client
+            assert result.connected is True
+
+    async def test_set_state_serializable_false_does_not_persist_across_requests(self):
+        """Non-serializable state is request-scoped and gone in a new context."""
+        server = FastMCP("test")
+        mock_session = MagicMock()
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            await context.set_state("key", object(), serializable=False)
+            assert await context.get_state("key") is not None
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            assert await context.get_state("key") is None
+
+    async def test_set_state_serializable_true_rejects_non_serializable(self):
+        """Default set_state raises TypeError for non-serializable values."""
+        server = FastMCP("test")
+        mock_session = MagicMock()
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            with pytest.raises(TypeError, match="serializable=False"):
+                await context.set_state("key", object())
+
+    async def test_set_state_serializable_false_shadows_session_state(self):
+        """Request-scoped state shadows session-scoped state for the same key."""
+        server = FastMCP("test")
+        mock_session = MagicMock()
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            await context.set_state("key", "session-value")
+            assert await context.get_state("key") == "session-value"
+
+            await context.set_state("key", "request-value", serializable=False)
+            assert await context.get_state("key") == "request-value"
+
+    async def test_delete_state_removes_from_both_stores(self):
+        """delete_state clears both request-scoped and session-scoped values."""
+        server = FastMCP("test")
+        mock_session = MagicMock()
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            await context.set_state("key", "session-value")
+            await context.set_state("key", "request-value", serializable=False)
+            assert await context.get_state("key") == "request-value"
+
+            await context.delete_state("key")
+            assert await context.get_state("key") is None
+
+    async def test_serializable_state_still_persists_across_requests(self):
+        """Serializable state (default) still persists across requests."""
+        server = FastMCP("test")
+        mock_session = MagicMock()
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            await context.set_state("key", "persistent")
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            assert await context.get_state("key") == "persistent"
+
+    async def test_serializable_write_clears_request_scoped_shadow(self):
+        """Writing serializable state clears any request-scoped shadow for the same key."""
+        server = FastMCP("test")
+        mock_session = MagicMock()
+
+        async with Context(fastmcp=server, session=mock_session) as context:
+            await context.set_state("key", "request-value", serializable=False)
+            assert await context.get_state("key") == "request-value"
+
+            # Serializable write should clear the shadow
+            await context.set_state("key", "session-value")
+            assert await context.get_state("key") == "session-value"
 
 
 class TestContextMeta:

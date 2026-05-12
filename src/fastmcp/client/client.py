@@ -4,6 +4,7 @@ import asyncio
 import copy
 import datetime
 import secrets
+import ssl
 import weakref
 from collections.abc import Coroutine
 from contextlib import AsyncExitStack, asynccontextmanager, suppress
@@ -20,6 +21,7 @@ from mcp.types import GetTaskResult, TaskStatusNotification
 from pydantic import AnyUrl
 
 import fastmcp
+from fastmcp.client.auth.oauth import OAuth
 from fastmcp.client.elicitation import ElicitationHandler, create_elicitation_callback
 from fastmcp.client.logging import (
     LogHandler,
@@ -68,7 +70,6 @@ from .transports import (
     PythonStdioTransport,
     SessionKwargs,
     SSETransport,
-    StdioTransport,
     StreamableHttpTransport,
     infer_transport,
 )
@@ -258,10 +259,34 @@ class Client(
         init_timeout: datetime.timedelta | float | int | None = None,
         client_info: mcp.types.Implementation | None = None,
         auth: httpx.Auth | Literal["oauth"] | str | None = None,
+        verify: ssl.SSLContext | bool | str | None = None,
     ) -> None:
         self.name = name or self.generate_name()
 
         self.transport = cast(ClientTransportT, infer_transport(transport))
+
+        if verify is not None:
+            from fastmcp.client.transports.http import StreamableHttpTransport
+            from fastmcp.client.transports.sse import SSETransport
+
+            if isinstance(self.transport, StreamableHttpTransport | SSETransport):
+                self.transport.verify = verify
+                # Re-sync existing OAuth auth with the new verify setting,
+                # but only if the transport doesn't have a custom factory
+                # (which takes precedence and was already applied to OAuth).
+                if (
+                    isinstance(self.transport.auth, OAuth)
+                    and auth is None
+                    and self.transport.httpx_client_factory is None
+                ):
+                    verify_factory = self.transport._make_verify_factory()
+                    if verify_factory is not None:
+                        self.transport.auth.httpx_client_factory = verify_factory
+            else:
+                raise ValueError(
+                    "The 'verify' parameter is only supported for HTTP transports."
+                )
+
         if auth is not None:
             self.transport._set_auth(auth)
 
@@ -299,19 +324,21 @@ class Client(
             self._session_kwargs["sampling_callback"] = create_sampling_callback(
                 sampling_handler
             )
-            # Default to tools-enabled capabilities unless explicitly overridden
             self._session_kwargs["sampling_capabilities"] = (
                 sampling_capabilities
                 if sampling_capabilities is not None
-                else mcp.types.SamplingCapability(
-                    tools=mcp.types.SamplingToolsCapability()
-                )
+                else mcp.types.SamplingCapability()
             )
 
         if elicitation_handler is not None:
             self._session_kwargs["elicitation_callback"] = create_elicitation_callback(
                 elicitation_handler
             )
+
+        # Maximum time to wait for a clean disconnect before giving up.
+        # Normally disconnects complete in <100ms; this is a safety net for
+        # unresponsive servers.
+        self._disconnect_timeout: float = fastmcp.settings.client_disconnect_timeout
 
         # Session context management - see class docstring for detailed explanation
         self._session_state = ClientSessionState()
@@ -367,11 +394,10 @@ class Client(
         self._session_kwargs["sampling_callback"] = create_sampling_callback(
             sampling_callback
         )
-        # Default to tools-enabled capabilities unless explicitly overridden
         self._session_kwargs["sampling_capabilities"] = (
             sampling_capabilities
             if sampling_capabilities is not None
-            else mcp.types.SamplingCapability(tools=mcp.types.SamplingToolsCapability())
+            else mcp.types.SamplingCapability()
         )
 
     def set_elicitation_callback(
@@ -406,9 +432,25 @@ class Client(
         """
         new_client = copy.copy(self)
 
-        if not isinstance(self.transport, StdioTransport):
-            # Reset session state to fresh state
-            new_client._session_state = ClientSessionState()
+        # Always reset session state so cloned clients start disconnected and do not
+        # share lifecycle state with the original instance.
+        new_client._session_state = ClientSessionState()
+
+        # Reset mutable task tracking state so new client is independent
+        new_client._task_registry = {}
+        new_client._submitted_task_ids = set()
+
+        # Create a fresh session kwargs dict so the clone doesn't share
+        # the original's mutable dict. Rebind the task notification handler
+        # to the new client if the default handler is in use; preserve any
+        # custom message handler the user may have set.
+        new_client._session_kwargs = {**self._session_kwargs}  # type: ignore[typeddict-item]
+        if isinstance(
+            self._session_kwargs.get("message_handler"), TaskNotificationHandler
+        ):
+            new_client._session_kwargs["message_handler"] = TaskNotificationHandler(
+                new_client
+            )
 
         new_client.name += f":{secrets.token_hex(2)}"
 
@@ -489,7 +531,7 @@ class Client(
         # Use a timeout to prevent hanging during cleanup if the connection is in a bad
         # state (e.g., rate-limited). The MCP SDK's transport may try to terminate the
         # session which can hang if the server is unresponsive.
-        with anyio.move_on_after(5):
+        with anyio.move_on_after(self._disconnect_timeout):
             await self._disconnect()
 
     async def _connect(self):
@@ -615,10 +657,19 @@ class Client(
             # stop the active session
             if self._session_state.session_task is None:
                 return
+            session_task = self._session_state.session_task
             self._session_state.stop_event.set()
             # wait for session to finish to ensure state has been reset
-            await self._session_state.session_task
-            self._session_state.session_task = None
+            try:
+                if force:
+                    with anyio.CancelScope(shield=True):
+                        with anyio.move_on_after(self._disconnect_timeout):
+                            with suppress(asyncio.CancelledError):
+                                await session_task
+                else:
+                    await session_task
+            finally:
+                self._session_state.session_task = None
 
     async def _session_runner(self):
         """

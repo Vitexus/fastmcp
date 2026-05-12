@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+import functools
 import inspect
+import types
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Generic, get_type_hints
+from typing import Annotated, Any, Generic, Union, get_args, get_origin, get_type_hints
 
 import mcp.types
 from pydantic import PydanticSchemaGenerationError
@@ -15,7 +17,8 @@ from fastmcp.server.dependencies import (
     transform_context_annotations,
     without_injected_parameters,
 )
-from fastmcp.tools.tool import ToolResult
+from fastmcp.tools.base import ToolResult
+from fastmcp.utilities.docstring_parsing import ParsedDocstring, parse_docstring
 from fastmcp.utilities.json_schema import compress_schema
 from fastmcp.utilities.logging import get_logger
 from fastmcp.utilities.types import (
@@ -24,8 +27,38 @@ from fastmcp.utilities.types import (
     Image,
     create_function_without_params,
     get_cached_typeadapter,
+    is_class_member_of_type,
     replace_type,
 )
+
+try:
+    from prefab_ui.app import PrefabApp as _PrefabApp
+    from prefab_ui.components.base import Component as _PrefabComponent
+
+    _PREFAB_TYPES: tuple[type, ...] = (_PrefabApp, _PrefabComponent)
+except ImportError:
+    _PREFAB_TYPES = ()
+
+
+def _contains_bytes_type(tp: Any) -> bool:
+    """Check if *tp* is or contains bytes, recursing through unions and Annotated."""
+    if tp is bytes:
+        return True
+    origin = get_origin(tp)
+    if origin is Union or origin is types.UnionType or origin is Annotated:
+        return any(_contains_bytes_type(a) for a in get_args(tp))
+    return False
+
+
+def _contains_prefab_type(tp: Any) -> bool:
+    """Check if *tp* is or contains a prefab type, recursing through unions and Annotated."""
+    if isinstance(tp, type) and issubclass(tp, _PREFAB_TYPES):
+        return True
+    origin = get_origin(tp)
+    if origin is Union or origin is types.UnionType or origin is Annotated:
+        return any(_contains_prefab_type(a) for a in get_args(tp))
+    return False
+
 
 T = TypeVarExt("T", default=Any)
 
@@ -34,8 +67,6 @@ logger = get_logger(__name__)
 
 @dataclass
 class _WrappedResult(Generic[T]):
-    """Generic wrapper for non-object return types."""
-
     result: T
 
 
@@ -43,8 +74,16 @@ class _UnserializableType:
     pass
 
 
-def _is_object_schema(schema: dict[str, Any]) -> bool:
+def _is_object_schema(
+    schema: dict[str, Any],
+    *,
+    _root_schema: dict[str, Any] | None = None,
+    _seen_refs: set[str] | None = None,
+) -> bool:
     """Check if a JSON schema represents an object type."""
+    root_schema = _root_schema or schema
+    seen_refs = _seen_refs or set()
+
     # Direct object type
     if schema.get("type") == "object":
         return True
@@ -53,9 +92,34 @@ def _is_object_schema(schema: dict[str, Any]) -> bool:
     if "properties" in schema:
         return True
 
-    # Self-referencing types use $ref pointing to $defs
-    # The referenced type is always an object in our use case
-    return "$ref" in schema and "$defs" in schema
+    # Resolve local $ref definitions and recurse into the target schema.
+    ref = schema.get("$ref")
+    if not isinstance(ref, str) or not ref.startswith("#/"):
+        return False
+
+    if ref in seen_refs:
+        return False
+
+    # Walk the JSON Pointer path from the root schema, unescaping each
+    # token per RFC 6901 (~1 → /, ~0 → ~).
+    pointer = ref.removeprefix("#/")
+    segments = pointer.split("/")
+    target: Any = root_schema
+    for segment in segments:
+        unescaped = segment.replace("~1", "/").replace("~0", "~")
+        if not isinstance(target, dict) or unescaped not in target:
+            return False
+        target = target[unescaped]
+
+    target_schema = target
+    if not isinstance(target_schema, dict):
+        return False
+
+    return _is_object_schema(
+        target_schema,
+        _root_schema=root_schema,
+        _seen_refs=seen_refs | {ref},
+    )
 
 
 @dataclass
@@ -65,6 +129,7 @@ class ParsedFunction:
     description: str | None
     input_schema: dict[str, Any]
     output_schema: dict[str, Any] | None
+    return_type: Any = None
 
     @classmethod
     def from_function(
@@ -98,16 +163,29 @@ class ParsedFunction:
                             f"Parameter '{arg_name}' in exclude_args must have a default value."
                         )
 
-        # collect name and doc before we potentially modify the function
+        # collect name and description before we potentially modify the function
         fn_name = getattr(fn, "__name__", None) or fn.__class__.__name__
-        fn_doc = inspect.getdoc(fn)
+        outer_docstring = parse_docstring(fn)
 
         # if the fn is a callable class, we need to get the __call__ method from here out
-        if not inspect.isroutine(fn):
+        if not inspect.isroutine(fn) and not isinstance(fn, functools.partial):
             fn = fn.__call__
         # if the fn is a staticmethod, we need to work with the underlying function
         if isinstance(fn, staticmethod):
             fn = fn.__func__
+
+        # For callable classes, parameter descriptions must come from
+        # __call__'s docstring — where the exposed parameters are actually
+        # declared. The class docstring's Args section, if any, typically
+        # describes __init__, so falling back to it would risk injecting
+        # constructor docs into __call__'s schema on overlapping names.
+        # The description, however, comes from the class docstring (which
+        # describes what the tool IS) when present.
+        inner_docstring = parse_docstring(fn)
+        parsed_docstring = ParsedDocstring(
+            description=outer_docstring.description or inner_docstring.description,
+            parameters=inner_docstring.parameters,
+        )
 
         # Transform Context type annotations to Depends() for unified DI
         fn = transform_context_annotations(fn)
@@ -129,6 +207,18 @@ class ParsedFunction:
             input_schema, prune_params=prune_params, prune_titles=True
         )
 
+        # Inject parameter descriptions from the docstring into the schema.
+        # Explicit annotations (Field(description=...), Annotated[x, "..."])
+        # already have a "description" key and take precedence.
+        if parsed_docstring.parameters:
+            properties = input_schema.get("properties", {})
+            for param_name, param_desc in parsed_docstring.parameters.items():
+                if (
+                    param_name in properties
+                    and "description" not in properties[param_name]
+                ):
+                    properties[param_name]["description"] = param_desc
+
         output_schema = None
         # Get the return annotation from the signature
         sig = inspect.signature(fn)
@@ -145,7 +235,27 @@ class ParsedFunction:
                 # If resolution fails, keep the string annotation
                 logger.debug("Failed to resolve type hint for return annotation: %s", e)
 
+        # Save original for return_type before any schema-related replacement
+        original_output_type = output_type
+
         if output_type not in (inspect._empty, None, Any, ...):
+            # bytes can't be represented as structured JSON output — skip schema
+            if _contains_bytes_type(output_type):
+                output_type = _UnserializableType
+
+            # Prefab component subclasses (Column, Card, etc.) shouldn't
+            # produce output schemas — replace_type only does exact matching,
+            # so we handle subclass matching explicitly here.  We also need
+            # to handle composite types like ``Column | None`` and
+            # ``Annotated[PrefabApp, ...]`` by recursing into their args.
+            if _PREFAB_TYPES and _contains_prefab_type(output_type):
+                output_type = _UnserializableType
+
+            # ToolResult subclasses should suppress schema generation just
+            # like ToolResult itself — replace_type only does exact matching.
+            if is_class_member_of_type(output_type, ToolResult):
+                output_type = _UnserializableType
+
             # there are a variety of types that we don't want to attempt to
             # serialize because they are either used by FastMCP internally,
             # or are MCP content types that explicitly don't form structured
@@ -164,6 +274,7 @@ class ParsedFunction:
                         mcp.types.AudioContent,
                         mcp.types.ResourceLink,
                         mcp.types.EmbeddedResource,
+                        *_PREFAB_TYPES,
                     ),
                     _UnserializableType,
                 ),
@@ -195,7 +306,8 @@ class ParsedFunction:
         return cls(
             fn=fn,
             name=fn_name,
-            description=fn_doc,
+            description=parsed_docstring.description,
             input_schema=input_schema,
             output_schema=output_schema or None,
+            return_type=original_output_type,
         )

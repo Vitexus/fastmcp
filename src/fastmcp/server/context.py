@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import warnings
 import weakref
 from collections.abc import Callable, Generator, Mapping, Sequence
 from contextlib import contextmanager
@@ -24,8 +25,11 @@ from mcp.types import Resource as SDKResource
 from pydantic.networks import AnyUrl
 from starlette.requests import Request
 from typing_extensions import TypeVar
+from uncalled_for import SharedContext
 
-from fastmcp.resources.resource import ResourceResult
+import fastmcp
+from fastmcp.exceptions import FastMCPDeprecationWarning
+from fastmcp.resources.base import ResourceResult
 from fastmcp.server.elicitation import (
     AcceptedElicitation,
     CancelledElicitation,
@@ -33,6 +37,7 @@ from fastmcp.server.elicitation import (
     handle_elicit_accept,
     parse_elicit_response_type,
 )
+from fastmcp.server.low_level import MiddlewareServerSession
 from fastmcp.server.sampling import SampleStep, SamplingResult, SamplingTool
 from fastmcp.server.sampling.run import (
     sample_impl,
@@ -160,6 +165,9 @@ class Context:
         await ctx.set_state("key", "value")
         value = await ctx.get_state("key")
 
+        # Store non-serializable values for the current request only
+        await ctx.set_state("client", http_client, serializable=False)
+
         return str(x)
     ```
 
@@ -181,10 +189,61 @@ class Context:
     # Default TTL for session state: 1 day in seconds
     _STATE_TTL_SECONDS: int = 86400
 
-    def __init__(self, fastmcp: FastMCP, session: ServerSession | None = None):
+    def __init__(
+        self,
+        fastmcp: FastMCP,
+        session: ServerSession | None = None,
+        *,
+        task_id: str | None = None,
+        origin_request_id: str | None = None,
+    ):
         self._fastmcp: weakref.ref[FastMCP] = weakref.ref(fastmcp)
         self._session: ServerSession | None = session  # For state ops during init
         self._tokens: list[Token] = []
+        # Background task support (SEP-1686)
+        self._task_id: str | None = task_id
+        self._origin_request_id: str | None = origin_request_id
+        # Request-scoped state for non-serializable values (serializable=False)
+        self._request_state: dict[str, Any] = {}
+
+    @property
+    def is_background_task(self) -> bool:
+        """True when this context is running in a background task (Docket worker).
+
+        When True, certain operations like elicit() and sample() will use
+        task-aware implementations that can pause the task and wait for
+        client input.
+
+        Example:
+            ```python
+            @server.tool(task=True)
+            async def my_task(ctx: Context) -> str:
+                # Works transparently in both foreground and background task modes
+                result = await ctx.elicit("Need input", str)
+                return str(result)
+            ```
+        """
+        return self._task_id is not None
+
+    @property
+    def task_id(self) -> str | None:
+        """Get the background task ID if running in a background task.
+
+        Returns None if not running in a background task context.
+        """
+        return self._task_id
+
+    @property
+    def origin_request_id(self) -> str | None:
+        """Get the request ID that originated this execution, if available.
+
+        In foreground request mode, this is the current request_id.
+        In background task mode, this is the request_id captured when the task
+        was submitted, if one was available.
+        """
+        if self.request_context is not None:
+            return str(self.request_context.request_id)
+        return self._origin_request_id
 
     @property
     def fastmcp(self) -> FastMCP:
@@ -196,6 +255,12 @@ class Context:
 
     async def __aenter__(self) -> Context:
         """Enter the context manager and set this context as the current context."""
+        # Inherit request-scoped state from parent context so middleware
+        # and tool contexts share the same in-memory state dict.
+        parent = _current_context.get(None)
+        if parent is not None:
+            self._request_state = parent._request_state
+
         # Always set this context and save the token
         token = _current_context.set(self)
         self._tokens.append(token)
@@ -205,25 +270,32 @@ class Context:
             _current_docket,
             _current_server,
             _current_worker,
+            is_docket_available,
         )
 
         self._server_token = _current_server.set(weakref.ref(self.fastmcp))
 
-        # Set docket/worker from server instance for this request's context.
-        # This ensures ContextVars work even in ASGI environments (Lambda, FastAPI mount)
-        # where lifespan ContextVars don't propagate to request handlers.
-        server = self.fastmcp
-        if server._docket is not None:
-            self._docket_token = _current_docket.set(server._docket)
+        # Re-set docket/worker from the server instance so mounted children
+        # inherit the parent's Docket via the ContextVar. Only servers that
+        # own the Docket (the parent) have _docket set; children skip this,
+        # leaving the parent's value in place.
+        if is_docket_available():
+            server = self.fastmcp
+            if server._docket is not None:
+                self._docket_token = _current_docket.set(server._docket)
+            if server._worker is not None:
+                self._worker_token = _current_worker.set(server._worker)
 
-        if server._worker is not None:
-            self._worker_token = _current_worker.set(server._worker)
+        if not is_docket_available():
+            # Without docket, the lifespan won't provide a SharedContext,
+            # so create one scoped to this Context for Shared() dependencies.
+            self._shared_context = SharedContext()
+            await self._shared_context.__aenter__()
 
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb) -> None:
         """Exit the context manager and reset the most recent token."""
-        # Reset server/docket/worker tokens
         from fastmcp.server.dependencies import (
             _current_docket,
             _current_server,
@@ -232,13 +304,17 @@ class Context:
 
         if hasattr(self, "_worker_token"):
             _current_worker.reset(self._worker_token)
-            delattr(self, "_worker_token")
+            del self._worker_token
         if hasattr(self, "_docket_token"):
             _current_docket.reset(self._docket_token)
-            delattr(self, "_docket_token")
+            del self._docket_token
+        if hasattr(self, "_shared_context"):
+            await self._shared_context.__aexit__(exc_type, exc_val, exc_tb)
+            del self._shared_context
+
         if hasattr(self, "_server_token"):
             _current_server.reset(self._server_token)
-            delattr(self, "_server_token")
+            del self._server_token
 
         # Reset context token
         if self._tokens:
@@ -282,6 +358,10 @@ class Context:
         Returns an empty dict if no lifespan was configured or if the MCP
         session is not yet established.
 
+        In background tasks (Docket workers), where request_context is not
+        available, falls back to reading from the FastMCP server's lifespan
+        result directly.
+
         Example:
         ```python
         @server.tool
@@ -294,6 +374,11 @@ class Context:
         """
         rc = self.request_context
         if rc is None:
+            # In background tasks, request_context is not available.
+            # Fall back to the server's lifespan result directly (#3095).
+            result = self.fastmcp._lifespan_result
+            if result is not None:
+                return result
             return {}
         return rc.lifespan_context
 
@@ -302,9 +387,13 @@ class Context:
     ) -> None:
         """Report progress for the current operation.
 
+        Works in both foreground (MCP progress notifications) and background
+        (Docket task execution) contexts.
+
         Args:
             progress: Current progress value e.g. 24
             total: Optional total value e.g. 100
+            message: Optional status message describing current progress
         """
 
         progress_token = (
@@ -313,16 +402,47 @@ class Context:
             else None
         )
 
-        if progress_token is None:
+        # Foreground: Send MCP progress notification if we have a token
+        if progress_token is not None:
+            await self.session.send_progress_notification(
+                progress_token=progress_token,
+                progress=progress,
+                total=total,
+                message=message,
+                related_request_id=self.request_id,
+            )
             return
 
-        await self.session.send_progress_notification(
-            progress_token=progress_token,
-            progress=progress,
-            total=total,
-            message=message,
-            related_request_id=self.request_id,
-        )
+        # Background: Update Docket execution progress (stored in Redis)
+        # This makes progress visible via tasks/get and notifications/tasks/status
+        from fastmcp.server.dependencies import is_docket_available
+
+        if not is_docket_available():
+            return
+
+        try:
+            from docket.dependencies import current_execution
+
+            execution = current_execution.get()
+
+            # Update progress in Redis using Docket's progress API.
+            # Docket only exposes increment() (relative), so we compute
+            # the delta from the last reported value stored on this execution.
+            if total is not None:
+                await execution.progress.set_total(int(total))
+
+            current = int(progress)
+            last: int = getattr(execution, "_fastmcp_last_progress", 0)
+            delta = current - last
+            if delta > 0:
+                await execution.progress.increment(delta)
+            execution._fastmcp_last_progress = current  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
+
+            if message is not None:
+                await execution.progress.set_message(message)
+        except LookupError:
+            # Not running in Docket worker context - no progress tracking available
+            pass
 
     async def _paginate_list(
         self,
@@ -342,12 +462,16 @@ class Context:
         """
         all_items: list[Any] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         while True:
             request = request_factory(cursor)
             result = await call_method(request)
             all_items.extend(extract_items(result))
-            if result.nextCursor is None:
+            if not result.nextCursor:
                 break
+            if result.nextCursor in seen_cursors:
+                break
+            seen_cursors.add(result.nextCursor)
             cursor = result.nextCursor
         return all_items
 
@@ -437,13 +561,14 @@ class Context:
             extra: Optional mapping for additional arguments
         """
         data = LogData(msg=message, extra=extra)
+        related_request_id = self.origin_request_id
 
         await _log_to_server_and_client(
             data=data,
             session=self.session,
             level=level or "info",
             logger_name=logger_name,
-            related_request_id=self.request_id,
+            related_request_id=related_request_id,
         )
 
     @property
@@ -454,6 +579,33 @@ class Context:
         or "streamable-http". Returns None if called outside of a server context.
         """
         return _current_transport.get()
+
+    def client_supports_extension(self, extension_id: str) -> bool:
+        """Check whether the connected client supports a given MCP extension.
+
+        Inspects the ``extensions`` extra field on ``ClientCapabilities``
+        sent by the client during initialization.
+
+        Returns ``False`` when no session is available (e.g., outside a
+        request context) or when the client did not advertise the extension.
+
+        Example::
+
+            from fastmcp.apps.config import UI_EXTENSION_ID
+
+            @mcp.tool
+            async def my_tool(ctx: Context) -> str:
+                if ctx.client_supports_extension(UI_EXTENSION_ID):
+                    return "UI-capable client"
+                return "text-only client"
+        """
+        rc = self.request_context
+        if rc is None:
+            return False
+        session = rc.session
+        if not isinstance(session, MiddlewareServerSession):
+            return False
+        return session.client_supports_extension(extension_id)
 
     @property
     def client_id(self) -> str | None:
@@ -531,21 +683,34 @@ class Context:
             session_id = str(uuid4())
 
         # Cache on session for consistency
-        session._fastmcp_state_prefix = session_id  # type: ignore[attr-defined]
+        session._fastmcp_state_prefix = session_id  # type: ignore[attr-defined]  # ty:ignore[unresolved-attribute]
         return session_id
 
     @property
     def session(self) -> ServerSession:
         """Access to the underlying session for advanced usage.
 
-        Raises RuntimeError if MCP request context is not available.
+        In request mode: Returns the session from the active request context.
+        In background task mode: Returns the session stored at Context creation.
+
+        Raises RuntimeError if no session is available.
         """
-        if self.request_context is None:
-            raise RuntimeError(
-                "session is not available because the MCP session has not been established yet. "
-                "Check `context.request_context` for None before accessing this attribute."
-            )
-        return self.request_context.session
+        # Background task mode: use the stored session
+        if self.is_background_task and self._session is not None:
+            return self._session
+
+        # Request mode: use request context
+        if self.request_context is not None:
+            return self.request_context.session
+
+        # Fallback to stored session (e.g., during on_initialize)
+        if self._session is not None:
+            return self._session
+
+        raise RuntimeError(
+            "session is not available because the MCP session has not been established yet. "
+            "Check `context.request_context` for None before accessing this attribute."
+        )
 
     # Convenience methods for common log levels
     async def debug(
@@ -678,6 +843,7 @@ class Context:
         tool_choice: ToolChoiceOption | str | None = None,
         execute_tools: bool = True,
         mask_error_details: bool | None = None,
+        tool_concurrency: int | None = None,
     ) -> SampleStep:
         """
         Make a single LLM sampling call.
@@ -701,6 +867,12 @@ class Context:
             mask_error_details: If True, mask detailed error messages from tool
                 execution. When None (default), uses the global settings value.
                 Tools can raise ToolError to bypass masking.
+            tool_concurrency: Controls parallel execution of tools:
+                - None (default): Sequential execution (one at a time)
+                - 0: Unlimited parallel execution
+                - N > 0: Execute at most N tools concurrently
+                If any tool has sequential=True, all tools execute sequentially
+                regardless of this setting.
 
         Returns:
             SampleStep containing:
@@ -734,6 +906,7 @@ class Context:
             tool_choice=tool_choice,
             auto_execute_tools=execute_tools,
             mask_error_details=mask_error_details,
+            tool_concurrency=tool_concurrency,
         )
 
     @overload
@@ -748,6 +921,7 @@ class Context:
         tools: Sequence[SamplingTool | Callable[..., Any]] | None = None,
         result_type: type[ResultT],
         mask_error_details: bool | None = None,
+        tool_concurrency: int | None = None,
     ) -> SamplingResult[ResultT]:
         """Overload: With result_type, returns SamplingResult[ResultT]."""
 
@@ -763,6 +937,7 @@ class Context:
         tools: Sequence[SamplingTool | Callable[..., Any]] | None = None,
         result_type: None = None,
         mask_error_details: bool | None = None,
+        tool_concurrency: int | None = None,
     ) -> SamplingResult[str]:
         """Overload: Without result_type, returns SamplingResult[str]."""
 
@@ -777,6 +952,7 @@ class Context:
         tools: Sequence[SamplingTool | Callable[..., Any]] | None = None,
         result_type: type[ResultT] | None = None,
         mask_error_details: bool | None = None,
+        tool_concurrency: int | None = None,
     ) -> SamplingResult[ResultT] | SamplingResult[str]:
         """
         Send a sampling request to the client and await the response.
@@ -807,14 +983,26 @@ class Context:
             mask_error_details: If True, mask detailed error messages from tool
                 execution. When None (default), uses the global settings value.
                 Tools can raise ToolError to bypass masking.
+            tool_concurrency: Controls parallel execution of tools:
+                - None (default): Sequential execution (one at a time)
+                - 0: Unlimited parallel execution
+                - N > 0: Execute at most N tools concurrently
+                If any tool has sequential=True, all tools execute sequentially
+                regardless of this setting.
 
         Returns:
             SamplingResult[T] containing:
             - .text: The text representation (raw text or JSON for structured)
             - .result: The typed result (str for text, parsed object for structured)
             - .history: All messages exchanged during sampling
+
+        Note:
+            Background task support for sampling is planned for a future release.
+            Currently, sampling in background tasks requires using the low-level
+            session.create_message() API directly.
         """
-        return await sample_impl(
+        # TODO: Add background task support similar to elicit() when is_background_task
+        return await sample_impl(  # ty: ignore[invalid-return-type]
             self,
             messages=messages,
             system_prompt=system_prompt,
@@ -824,6 +1012,7 @@ class Context:
             tools=tools,
             result_type=result_type,
             mask_error_details=mask_error_details,
+            tool_concurrency=tool_concurrency,
         )
 
     @overload
@@ -831,6 +1020,9 @@ class Context:
         self,
         message: str,
         response_type: None,
+        *,
+        response_title: str | None = None,
+        response_description: str | None = None,
     ) -> (
         AcceptedElicitation[dict[str, Any]] | DeclinedElicitation | CancelledElicitation
     ): ...
@@ -843,6 +1035,9 @@ class Context:
         self,
         message: str,
         response_type: type[T],
+        *,
+        response_title: str | None = None,
+        response_description: str | None = None,
     ) -> AcceptedElicitation[T] | DeclinedElicitation | CancelledElicitation: ...
 
     """When response_type is not None, the accepted elicitation will contain the
@@ -853,6 +1048,9 @@ class Context:
         self,
         message: str,
         response_type: list[str],
+        *,
+        response_title: str | None = None,
+        response_description: str | None = None,
     ) -> AcceptedElicitation[str] | DeclinedElicitation | CancelledElicitation: ...
 
     """When response_type is a list of strings, the accepted elicitation will
@@ -863,6 +1061,9 @@ class Context:
         self,
         message: str,
         response_type: dict[str, dict[str, str]],
+        *,
+        response_title: str | None = None,
+        response_description: str | None = None,
     ) -> AcceptedElicitation[str] | DeclinedElicitation | CancelledElicitation: ...
 
     """When response_type is a dict mapping keys to title dicts, the accepted
@@ -873,6 +1074,9 @@ class Context:
         self,
         message: str,
         response_type: list[list[str]],
+        *,
+        response_title: str | None = None,
+        response_description: str | None = None,
     ) -> (
         AcceptedElicitation[list[str]] | DeclinedElicitation | CancelledElicitation
     ): ...
@@ -885,6 +1089,9 @@ class Context:
         self,
         message: str,
         response_type: list[dict[str, dict[str, str]]],
+        *,
+        response_title: str | None = None,
+        response_description: str | None = None,
     ) -> (
         AcceptedElicitation[list[str]] | DeclinedElicitation | CancelledElicitation
     ): ...
@@ -902,6 +1109,9 @@ class Context:
         | list[list[str]]
         | list[dict[str, dict[str, str]]]
         | None = None,
+        *,
+        response_title: str | None = None,
+        response_description: str | None = None,
     ) -> (
         AcceptedElicitation[T]
         | AcceptedElicitation[dict[str, Any]]
@@ -923,23 +1133,61 @@ class Context:
         "value" field will be generated for the MCP interaction and
         automatically deconstructed into the primitive type upon response.
 
-        If the response_type is None, the generated schema will be that of an
-        empty object in order to comply with the MCP protocol requirements.
-        Clients must send an empty object ("{}")in response.
+        Passing ``response_type=None`` (or omitting it) is deprecated and will
+        be removed in a future version. The resulting empty-schema form-mode
+        request is ambiguous and causes some clients (e.g. VS Code) to hang on
+        an empty form. Pass an explicit ``response_type`` describing the data
+        you want back.
 
         Args:
             message: A human-readable message explaining what information is needed
             response_type: The type of the response, which should be a primitive
                 type or dataclass or BaseModel. If it is a primitive type, an
                 object schema with a single "value" field will be generated.
-        """
-        config = parse_elicit_response_type(response_type)
+            response_title: Optional label to display for the wrapped ``value``
+                field when ``response_type`` is a scalar, Literal, Enum, or one
+                of the dict/list shorthand forms. Overrides the auto-generated
+                "Value" label. Raises ``TypeError`` if passed with a BaseModel,
+                dataclass, or ``None`` response type (use ``Field(title=...)``
+                on the model instead).
+            response_description: Optional description to attach to the wrapped
+                ``value`` field. Same scope rules as ``response_title``.
 
-        result = await self.session.elicit(
-            message=message,
-            requestedSchema=config.schema,
-            related_request_id=self.request_id,
+        Note:
+            This method works transparently in both request and background task
+            contexts. In background task mode (SEP-1686), it will set the task
+            status to "input_required" and wait for the client to provide input.
+        """
+        if response_type is None and fastmcp.settings.deprecation_warnings:
+            warnings.warn(
+                "Calling ctx.elicit() without a response_type is deprecated "
+                "and will be removed in a future version. The empty-schema "
+                "form-mode request is ambiguous under the current MCP spec "
+                "and causes some clients (e.g. VS Code) to render an empty, "
+                "non-functional form. Pass an explicit response_type "
+                "describing the data you expect back.",
+                FastMCPDeprecationWarning,
+                stacklevel=2,
+            )
+        config = parse_elicit_response_type(
+            response_type,
+            response_title=response_title,
+            response_description=response_description,
         )
+
+        if self.is_background_task:
+            # Background task mode: use task-aware elicitation
+            result = await self._elicit_for_task(
+                message=message,
+                schema=config.schema,
+            )
+        else:
+            # Standard request mode: use session.elicit directly
+            result = await self.session.elicit(
+                message=message,
+                requestedSchema=config.schema,
+                related_request_id=self.request_id,
+            )
 
         if result.action == "accept":
             return handle_elicit_accept(config, result.content)
@@ -950,36 +1198,113 @@ class Context:
         else:
             raise ValueError(f"Unexpected elicitation action: {result.action}")
 
+    async def _elicit_for_task(
+        self,
+        message: str,
+        schema: dict[str, Any],
+    ) -> mcp.types.ElicitResult:
+        """Send an elicitation request from a background task (SEP-1686).
+
+        This method handles elicitation when running in a Docket worker context,
+        where there's no active MCP request. It:
+        1. Sets the task status to "input_required"
+        2. Sends the elicitation request with task metadata
+        3. Waits for the client to provide input via tasks/sendInput
+        4. Returns the result and resumes task execution
+
+        Args:
+            message: The message to display to the user
+            schema: The JSON schema for the expected response
+
+        Returns:
+            ElicitResult with the user's response
+
+        Raises:
+            RuntimeError: If not running in a background task context
+        """
+        if not self.is_background_task:
+            raise RuntimeError(
+                "_elicit_for_task called but not in a background task context"
+            )
+
+        # Import here to avoid circular imports and optional dependency issues
+        from fastmcp.server.tasks.elicitation import elicit_for_task
+
+        return await elicit_for_task(
+            task_id=self._task_id,  # type: ignore[arg-type]  # ty:ignore[invalid-argument-type]
+            session=self._session,
+            message=message,
+            schema=schema,
+            fastmcp=self.fastmcp,
+        )
+
     def _make_state_key(self, key: str) -> str:
         """Create session-prefixed key for state storage."""
         return f"{self.session_id}:{key}"
 
-    async def set_state(self, key: str, value: Any) -> None:
-        """Set a value in the session-scoped state store.
+    async def set_state(
+        self, key: str, value: Any, *, serializable: bool = True
+    ) -> None:
+        """Set a value in the state store.
 
-        Values persist across requests within the same MCP session.
+        By default, values are stored in the session-scoped state store and
+        persist across requests within the same MCP session. Values must be
+        JSON-serializable (dicts, lists, strings, numbers, etc.).
+
+        For non-serializable values (e.g., HTTP clients, database connections),
+        pass ``serializable=False``. These values are stored in a request-scoped
+        dict and only live for the current MCP request (tool call, resource
+        read, or prompt render). They will not be available in subsequent
+        requests.
+
         The key is automatically prefixed with the session identifier.
-        State expires after 1 day to prevent unbounded memory growth.
         """
         prefixed_key = self._make_state_key(key)
-        await self.fastmcp._state_store.put(
-            key=prefixed_key,
-            value=StateValue(value=value),
-            ttl=self._STATE_TTL_SECONDS,
-        )
+        if not serializable:
+            self._request_state[prefixed_key] = value
+            return
+        # Clear any request-scoped shadow so the session value is visible
+        self._request_state.pop(prefixed_key, None)
+        try:
+            await self.fastmcp._state_store.put(
+                key=prefixed_key,
+                value=StateValue(value=value),
+                ttl=self._STATE_TTL_SECONDS,
+            )
+        except Exception as e:
+            # Catch serialization errors from Pydantic (ValueError) or
+            # the key_value library (SerializationError). Both contain
+            # "serialize" in the message. Other exceptions propagate as-is.
+            if "serialize" in str(e).lower():
+                raise TypeError(
+                    f"Value for state key {key!r} is not serializable. "
+                    f"Use set_state({key!r}, value, serializable=False) to store "
+                    f"non-serializable values. Note: non-serializable state is "
+                    f"request-scoped and will not persist across requests."
+                ) from e
+            raise
 
     async def get_state(self, key: str) -> Any:
-        """Get a value from the session-scoped state store.
+        """Get a value from the state store.
+
+        Checks request-scoped state first (set with ``serializable=False``),
+        then falls back to the session-scoped state store.
 
         Returns None if the key is not found.
         """
         prefixed_key = self._make_state_key(key)
+        if prefixed_key in self._request_state:
+            return self._request_state[prefixed_key]
         result = await self.fastmcp._state_store.get(key=prefixed_key)
         return result.value if result is not None else None
 
     async def delete_state(self, key: str) -> None:
-        """Delete a value from the session-scoped state store."""
+        """Delete a value from the state store.
+
+        Removes from both request-scoped and session-scoped stores.
+        """
         prefixed_key = self._make_state_key(key)
+        self._request_state.pop(prefixed_key, None)
         await self.fastmcp._state_store.delete(key=prefixed_key)
 
     # -------------------------------------------------------------------------
@@ -1081,6 +1406,18 @@ class Context:
         await _reset_visibility(self)
 
 
+_MCP_LEVEL_SEVERITY: dict[LoggingLevel, int] = {
+    "debug": 0,
+    "info": 1,
+    "notice": 2,
+    "warning": 3,
+    "error": 4,
+    "critical": 5,
+    "alert": 6,
+    "emergency": 7,
+}
+
+
 async def _log_to_server_and_client(
     data: LogData,
     session: ServerSession,
@@ -1089,6 +1426,13 @@ async def _log_to_server_and_client(
     related_request_id: str | None = None,
 ) -> None:
     """Log a message to the server and client."""
+    from fastmcp.server.low_level import MiddlewareServerSession
+
+    if isinstance(session, MiddlewareServerSession):
+        min_level = session._minimum_logging_level or session.fastmcp.client_log_level
+        if min_level is not None:
+            if _MCP_LEVEL_SEVERITY[level] < _MCP_LEVEL_SEVERITY[min_level]:
+                return
 
     msg_prefix = f"Sending {level.upper()} to client"
 

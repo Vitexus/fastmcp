@@ -13,12 +13,9 @@ from mcp.types import TextContent
 from fastmcp import FastMCP
 from fastmcp.contrib.mcp_mixin import mcp_tool
 from fastmcp.server.providers import LocalProvider
-from fastmcp.tools.tool import Tool, _convert_to_content
+from fastmcp.tools.base import Tool, _convert_to_content
 from fastmcp.tools.tool_transform import TransformedTool
 from fastmcp.utilities.tests import temporary_settings
-
-# Reset deprecation warnings for this module
-pytestmark = pytest.mark.filterwarnings("default::DeprecationWarning")
 
 
 class TestToolSerializerDeprecated:
@@ -143,15 +140,14 @@ class TestSerializerDeprecationWarnings:
             with pytest.warns(DeprecationWarning, match="serializer.*deprecated"):
                 provider.tool(my_tool, serializer=custom_serializer)
 
-    def test_fastmcp_tool_serializer_parameter_warning(self):
-        """Test that FastMCP tool_serializer parameter warns."""
+    def test_fastmcp_tool_serializer_parameter_raises_type_error(self):
+        """Test that FastMCP tool_serializer parameter raises TypeError."""
 
         def custom_serializer(data) -> str:
             return f"Custom: {data}"
 
-        with temporary_settings(deprecation_warnings=True):
-            with pytest.warns(DeprecationWarning, match="tool_serializer.*deprecated"):
-                FastMCP("TestServer", tool_serializer=custom_serializer)
+        with pytest.raises(TypeError, match="no longer accepts `tool_serializer`"):
+            FastMCP("TestServer", tool_serializer=custom_serializer)
 
     def test_transformed_tool_from_tool_serializer_warning(self):
         """Test that TransformedTool.from_tool warns when serializer is provided."""

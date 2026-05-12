@@ -150,6 +150,36 @@ class TestRemoteAuthProvider:
             "https://api.example.com/.well-known/oauth-protected-resource/mcp"
         )
 
+    def test_get_resource_url_uses_resource_base_url_when_provided(self, test_tokens):
+        """Test protected resource URLs are derived from resource_base_url when provided."""
+        token_verifier = StaticTokenVerifier(tokens=test_tokens)
+        provider = RemoteAuthProvider(
+            token_verifier=token_verifier,
+            authorization_servers=[AnyHttpUrl("https://auth.example.com")],
+            base_url="https://auth.example.com/proxy",
+            resource_base_url="https://api.example.com",
+        )
+
+        assert provider._get_resource_url("/mcp") == AnyHttpUrl(
+            "https://api.example.com/mcp"
+        )
+
+    def test_init_preserves_legacy_positional_scopes_supported_slot(self, test_tokens):
+        """Legacy positional scopes_supported should not bind to resource_base_url."""
+        token_verifier = StaticTokenVerifier(tokens=test_tokens)
+        provider = RemoteAuthProvider(
+            token_verifier,
+            [AnyHttpUrl("https://auth.example.com")],
+            "https://api.example.com",
+            ["read"],
+        )
+
+        assert provider._scopes_supported == ["read"]
+        assert provider.resource_base_url is None
+        assert provider._get_resource_url("/mcp") == AnyHttpUrl(
+            "https://api.example.com/mcp"
+        )
+
 
 class TestRemoteAuthProviderIntegration:
     """Integration tests for RemoteAuthProvider with FastMCP server."""
@@ -483,3 +513,60 @@ class TestRemoteAuthProviderIntegration:
                 data["resource_documentation"]
                 == "https://doc.my-server.com/resource-docs"
             )
+
+    async def test_scopes_supported_overrides_metadata(self):
+        """Test that scopes_supported parameter overrides what's in metadata."""
+        token_verifier = StaticTokenVerifier(
+            tokens={
+                "test": {"client_id": "c", "scopes": ["read"]},
+            },
+            required_scopes=["read"],
+        )
+
+        provider = RemoteAuthProvider(
+            token_verifier=token_verifier,
+            authorization_servers=[AnyHttpUrl("https://auth.example.com")],
+            base_url="https://my-server.com",
+            scopes_supported=["api://my-api/read"],
+        )
+
+        mcp = FastMCP("test-server", auth=provider)
+        mcp_http_app = mcp.http_app()
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_http_app),
+            base_url="https://my-server.com",
+        ) as client:
+            response = await client.get("/.well-known/oauth-protected-resource/mcp")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["scopes_supported"] == ["api://my-api/read"]
+
+    async def test_scopes_supported_defaults_to_verifier(self):
+        """Test that metadata uses verifier scopes_supported when parameter not set."""
+        token_verifier = StaticTokenVerifier(
+            tokens={
+                "test": {"client_id": "c", "scopes": ["read"]},
+            },
+            required_scopes=["read"],
+        )
+
+        provider = RemoteAuthProvider(
+            token_verifier=token_verifier,
+            authorization_servers=[AnyHttpUrl("https://auth.example.com")],
+            base_url="https://my-server.com",
+        )
+
+        mcp = FastMCP("test-server", auth=provider)
+        mcp_http_app = mcp.http_app()
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=mcp_http_app),
+            base_url="https://my-server.com",
+        ) as client:
+            response = await client.get("/.well-known/oauth-protected-resource/mcp")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["scopes_supported"] == ["read"]
