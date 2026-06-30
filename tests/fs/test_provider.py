@@ -1,5 +1,6 @@
 """Tests for FileSystemProvider."""
 
+import asyncio
 import time
 from pathlib import Path
 
@@ -183,7 +184,7 @@ def original() -> str:
         assert provider._loaded
         assert len(provider._components) == 1
 
-        # Add another file - should be picked up on next _ensure_loaded
+        # Add another file - should be picked up on next read
         (tmp_path / "tool2.py").write_text(
             """\
 from fastmcp.tools import tool
@@ -194,9 +195,9 @@ def added() -> str:
 """
         )
 
-        # With reload=True, _ensure_loaded re-scans
-        await provider._ensure_loaded()
-        assert len(provider._components) == 2
+        # With reload=True, reading triggers a re-scan
+        tools = await provider._list_tools()
+        assert len(tools) == 2
 
     async def test_warning_deduplication_same_file(self, tmp_path: Path, capsys):
         """Warnings for the same broken file should not repeat."""
@@ -211,7 +212,7 @@ def added() -> str:
         assert "WARNING" in captured.err and "Failed to import" in captured.err
 
         # Second load (same file, unchanged) - should NOT warn again
-        await provider._ensure_loaded()
+        await provider._list_tools()
         captured = capsys.readouterr()
         assert "Failed to import" not in captured.err
 
@@ -232,7 +233,7 @@ def added() -> str:
         bad_file.write_text("syntax error here !!!")
 
         # Next load - should warn again (file changed)
-        await provider._ensure_loaded()
+        await provider._list_tools()
         captured = capsys.readouterr()
         # Check for warning indicator (rich may truncate long paths)
         assert "WARNING" in captured.err and "Failed to import" in captured.err
@@ -262,7 +263,7 @@ def my_tool() -> str:
         )
 
         # Load again - should NOT warn, file is fixed
-        await provider._ensure_loaded()
+        await provider._list_tools()
         captured = capsys.readouterr()
         assert "Failed to import" not in captured.err
         assert len(provider._components) == 1
@@ -272,10 +273,48 @@ def my_tool() -> str:
         bad_file.write_text("1/0  # broken again")
 
         # Should warn again
-        await provider._ensure_loaded()
+        await provider._list_tools()
         captured = capsys.readouterr()
         # Check for warning indicator (rich may truncate long paths)
         assert "WARNING" in captured.err and "Failed to import" in captured.err
+
+
+class TestFileSystemProviderReloadRace:
+    """Test that concurrent readers don't see empty components during reload."""
+
+    async def test_concurrent_reader_never_sees_empty(self, tmp_path: Path):
+        """A reader during reload should see either old or new components, never empty."""
+        (tmp_path / "tool.py").write_text(
+            """\
+from fastmcp.tools import tool
+
+@tool
+def my_tool() -> str:
+    return "hello"
+"""
+        )
+
+        provider = FileSystemProvider(tmp_path, reload=True)
+        assert len(await provider._list_tools()) == 1
+
+        observed_empty = False
+
+        async def reader():
+            nonlocal observed_empty
+            for _ in range(20):
+                tools = await provider._list_tools()
+                if len(tools) == 0:
+                    observed_empty = True
+                await asyncio.sleep(0)
+
+        async def reloader():
+            for _ in range(5):
+                provider._loaded = False
+                await provider._list_tools()  # triggers reload
+                await asyncio.sleep(0)
+
+        await asyncio.gather(reader(), reloader())
+        assert not observed_empty, "Reader saw empty components during reload"
 
 
 class TestFileSystemProviderIntegration:
@@ -419,6 +458,100 @@ def charge(amount: float) -> str:
             assert len(tools_list) == 2
             names = {t.name for t in tools_list}
             assert names == {"greet", "charge"}
+
+    async def test_mounted_servers_with_same_package_and_module_name(
+        self, tmp_path: Path
+    ):
+        """Two providers sharing a package/module path should not collide.
+
+        Reproduces the exact scenario from the bug report: both providers have a
+        `components/tools.py` package. Without isolation the second provider
+        reuses the first's cached module and `list_tools` returns the first
+        server's tool twice.
+        """
+        for server_name, tool_name in [
+            ("server1", "server1_tool"),
+            ("server2", "server2_tool"),
+        ]:
+            components = tmp_path / server_name / "components"
+            components.mkdir(parents=True)
+            (components / "__init__.py").write_text("")
+            (components / "tools.py").write_text(
+                f"""\
+from fastmcp.tools import tool
+
+@tool
+def {tool_name}() -> str:
+    return "{tool_name}"
+"""
+            )
+
+        server1 = FastMCP(
+            "server1",
+            providers=[FileSystemProvider(tmp_path / "server1" / "components")],
+        )
+        server2 = FastMCP(
+            "server2",
+            providers=[FileSystemProvider(tmp_path / "server2" / "components")],
+        )
+        parent = FastMCP("parent")
+        parent.mount(server1)
+        parent.mount(server2)
+
+        tools = await parent.list_tools()
+        assert {t.name for t in tools} == {"server1_tool", "server2_tool"}
+
+        result = await parent.call_tool("server2_tool", {})
+        assert "server2_tool" in str(result)
+
+    async def test_mounted_servers_with_same_package_different_module(
+        self, tmp_path: Path
+    ):
+        """Same package name but different module filenames must coexist.
+
+        The package directory name (`components`) collides while the leaf module
+        differs (`a.py` vs `b.py`). The shared package must not resolve to the
+        first provider's directory, which would drop the second provider's tool.
+        A relative import inside each module exercises that the isolated tree is
+        a real package.
+        """
+        for server_name, module_name, tool_name in [
+            ("server1", "a", "server1_tool"),
+            ("server2", "b", "server2_tool"),
+        ]:
+            components = tmp_path / server_name / "components"
+            components.mkdir(parents=True)
+            (components / "__init__.py").write_text("")
+            (components / "_shared.py").write_text(f'LABEL = "{tool_name}"\n')
+            (components / f"{module_name}.py").write_text(
+                f"""\
+from fastmcp.tools import tool
+
+from ._shared import LABEL
+
+@tool
+def {tool_name}() -> str:
+    return LABEL
+"""
+            )
+
+        server1 = FastMCP(
+            "server1",
+            providers=[FileSystemProvider(tmp_path / "server1" / "components")],
+        )
+        server2 = FastMCP(
+            "server2",
+            providers=[FileSystemProvider(tmp_path / "server2" / "components")],
+        )
+        parent = FastMCP("parent")
+        parent.mount(server1)
+        parent.mount(server2)
+
+        tools = await parent.list_tools()
+        assert {t.name for t in tools} == {"server1_tool", "server2_tool"}
+
+        result = await parent.call_tool("server2_tool", {})
+        assert "server2_tool" in str(result)
 
 
 class TestFileSystemProviderVersioning:

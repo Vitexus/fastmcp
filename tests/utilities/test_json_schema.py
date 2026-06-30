@@ -1,3 +1,4 @@
+import copy
 from unittest.mock import patch
 
 from jsonref import replace_refs
@@ -50,6 +51,17 @@ class TestPruneParam:
         }
         result = _prune_param(schema, "foo")
         assert "required" not in result
+
+    def test_does_not_mutate_input(self):
+        """Test that _prune_param does not mutate the original schema."""
+        schema = {
+            "type": "object",
+            "properties": {"a": {"type": "string"}, "b": {"type": "integer"}},
+            "required": ["a", "b"],
+        }
+        original = copy.deepcopy(schema)
+        _prune_param(schema, "a")
+        assert schema == original
 
 
 class TestDereferenceRefs:
@@ -108,6 +120,9 @@ class TestDereferenceRefs:
                 }
             },
             "$ref": "#/$defs/Node",
+            "title": "Tree node",
+            "description": "A recursive tree node.",
+            "examples": [{"children": []}],
         }
         result = dereference_refs(schema)
 
@@ -115,6 +130,45 @@ class TestDereferenceRefs:
         # Root should be resolved but nested refs preserved
         assert result.get("type") == "object"
         assert "$defs" in result  # $defs preserved for circular refs
+        assert result["title"] == "Tree node"
+        assert result["description"] == "A recursive tree node."
+        assert result["examples"] == [{"children": []}]
+
+    def test_falls_back_for_circular_json_pointer_refs(self):
+        """Test that circular JSON Pointer $ref (non-$defs) does not crash.
+
+        .NET/System.Text.Json emits $ref with JSON Pointer paths like
+        #/properties/nodes/items instead of $defs-based references.
+        Circular pointers must not cause a RecursionError.
+        """
+        schema = {
+            "type": "object",
+            "properties": {
+                "nodes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "value": {"type": "string"},
+                            "children": {
+                                "type": "array",
+                                "items": {"$ref": "#/properties/nodes/items"},
+                            },
+                        },
+                    },
+                },
+            },
+        }
+        result = dereference_refs(schema)
+
+        # Should return the schema without crashing; circular refs stay unresolved
+        assert result["type"] == "object"
+        assert "properties" in result
+        # The circular $ref should be preserved (not inlined)
+        children_items = result["properties"]["nodes"]["items"]["properties"][
+            "children"
+        ]["items"]
+        assert children_items["$ref"] == "#/properties/nodes/items"
 
     def test_preserves_sibling_keywords(self):
         """Test that sibling keywords (default, description) are preserved.
@@ -237,6 +291,48 @@ class TestDereferenceRefs:
         assert len(result["anyOf"]) == 2
         actions = {v["properties"]["action"]["const"] for v in result["anyOf"]}
         assert actions == {"identify", "delete"}
+
+    def test_discriminator_property_remains_required_after_inlining(self):
+        schema = {
+            "$defs": {
+                "Comprehensive": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "comprehensive", "type": "string"},
+                    },
+                },
+                "Validate": {
+                    "type": "object",
+                    "properties": {
+                        "kind": {"const": "validate", "type": "string"},
+                        "target_id": {"type": "string"},
+                    },
+                    "required": ["target_id"],
+                },
+            },
+            "anyOf": [
+                {"$ref": "#/$defs/Comprehensive"},
+                {"$ref": "#/$defs/Validate"},
+            ],
+            "discriminator": {
+                "mapping": {
+                    "comprehensive": "#/$defs/Comprehensive",
+                    "validate": "#/$defs/Validate",
+                },
+                "propertyName": "kind",
+            },
+        }
+        result = dereference_refs(schema)
+
+        assert "discriminator" not in result
+        for variant in result["anyOf"]:
+            assert "kind" in variant["required"]
+        validate_schema = next(
+            variant
+            for variant in result["anyOf"]
+            if variant["properties"]["kind"]["const"] == "validate"
+        )
+        assert validate_schema["required"] == ["target_id", "kind"]
 
     def test_preserves_property_named_discriminator(self):
         """A field *named* 'discriminator' inside properties must survive."""

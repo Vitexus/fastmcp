@@ -1,5 +1,6 @@
 """Tests for OAuth proxy token endpoint and handling."""
 
+import logging
 import time
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -21,8 +22,11 @@ from fastmcp.server.auth.oauth_proxy import OAuthProxy
 from fastmcp.server.auth.oauth_proxy.models import (
     DEFAULT_ACCESS_TOKEN_EXPIRY_NO_REFRESH_SECONDS,
     DEFAULT_ACCESS_TOKEN_EXPIRY_SECONDS,
+    DEFAULT_REFRESH_TOKEN_EXPIRY_SECONDS,
     ClientCode,
     JTIMapping,
+    OAuthTransaction,
+    RefreshTokenMetadata,
     UpstreamTokenSet,
     _hash_token,
 )
@@ -193,6 +197,57 @@ class TestOAuthProxyTokenEndpointAuth:
                 token_endpoint_auth_method="client_secret_post",
                 timeout=30.0,
             )
+            mock_client.aclose.assert_awaited_once()
+
+    async def test_callback_closes_upstream_oauth_client(self, jwt_verifier):
+        proxy = OAuthProxy(
+            upstream_authorization_endpoint="https://oauth.example.com/authorize",
+            upstream_token_endpoint="https://oauth.example.com/token",
+            upstream_client_id="client-id",
+            upstream_client_secret="client-secret",
+            token_verifier=jwt_verifier,
+            base_url="https://proxy.example.com",
+            require_authorization_consent=False,
+            jwt_signing_key="test-secret",
+            client_storage=MemoryStore(),
+        )
+
+        await proxy._transaction_store.put(
+            key="txn-id",
+            value=OAuthTransaction(
+                txn_id="txn-id",
+                client_id="test-client",
+                client_redirect_uri="http://localhost:12345/callback",
+                client_state="client-state",
+                code_challenge="",
+                code_challenge_method="S256",
+                scopes=["read"],
+                created_at=time.time(),
+            ),
+        )
+
+        mock_request = Mock()
+        mock_request.query_params = {"code": "idp-code", "state": "txn-id"}
+        mock_request.cookies = {}
+
+        mock_client = AsyncMock()
+        mock_client.fetch_token = AsyncMock(
+            return_value={
+                "access_token": "upstream-access-token",
+                "refresh_token": "upstream-refresh-token",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+            }
+        )
+
+        with patch.object(
+            proxy, "_create_upstream_oauth_client", return_value=mock_client
+        ):
+            response = await proxy._handle_idp_callback(mock_request)
+
+        assert response.status_code == 302
+        mock_client.fetch_token.assert_awaited_once()
+        mock_client.aclose.assert_awaited_once()
 
 
 class TestTokenHandlerErrorTransformation:
@@ -331,6 +386,614 @@ class TestFallbackAccessTokenExpiry:
         )
 
         assert provider._fallback_access_token_expiry_seconds is None
+
+
+class TestFallbackRefreshTokenExpiry:
+    """Tests for fallback_refresh_token_expiry_seconds (issue #3987).
+
+    When upstream omits `refresh_expires_in`, the FastMCP refresh JWT and the
+    JTI mapping must use the configured fallback (default 1 year), not a
+    hardcoded 30-day value. The FastMCP refresh JWT is a signed pointer; the
+    real upstream refresh remains the source of truth.
+    """
+
+    @pytest.fixture
+    def jwt_verifier(self):
+        verifier = Mock(spec=TokenVerifier)
+        verifier.required_scopes = ["read", "write"]
+        verifier.verify_token = AsyncMock(return_value=None)
+        return verifier
+
+    def test_default_constant(self):
+        assert DEFAULT_REFRESH_TOKEN_EXPIRY_SECONDS == 60 * 60 * 24 * 365  # 1 year
+
+    def test_fallback_defaults_to_one_year(self, jwt_verifier):
+        provider = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=jwt_verifier,
+            base_url="http://localhost:8000",
+            jwt_signing_key="test-signing-key",
+            client_storage=MemoryStore(),
+        )
+        assert (
+            provider._fallback_refresh_token_expiry_seconds
+            == DEFAULT_REFRESH_TOKEN_EXPIRY_SECONDS
+        )
+
+    def test_fallback_parameter_stored(self, jwt_verifier):
+        provider = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=jwt_verifier,
+            base_url="http://localhost:8000",
+            jwt_signing_key="test-signing-key",
+            fallback_refresh_token_expiry_seconds=7 * 24 * 60 * 60,  # 7 days
+            client_storage=MemoryStore(),
+        )
+        assert provider._fallback_refresh_token_expiry_seconds == 7 * 24 * 60 * 60
+
+    async def test_initial_exchange_jti_mapping_aligned_with_refresh_expiry(
+        self, jwt_verifier
+    ):
+        """Bug 1: JTI mapping TTL must align with refresh_expires_in.
+
+        Previously hardcoded to 30 days, which silently expired the mapping
+        early when upstream returned a longer refresh lifetime.
+        """
+        proxy = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=jwt_verifier,
+            base_url="https://proxy.example.com",
+            jwt_signing_key="test-secret-key",
+            client_storage=MemoryStore(),
+        )
+        proxy.set_mcp_path("/mcp")
+
+        client = OAuthClientInformationFull(
+            client_id="test-client",
+            client_secret="test-secret",
+            redirect_uris=[AnyUrl("http://localhost:12345/callback")],
+        )
+        await proxy.register_client(client)
+
+        # Upstream returns 1-year refresh expiry — well past the old 30d default
+        one_year = 60 * 60 * 24 * 365
+        client_code = ClientCode(
+            code="long-refresh-code",
+            client_id="test-client",
+            redirect_uri="http://localhost:12345/callback",
+            code_challenge="test-challenge",
+            code_challenge_method="S256",
+            scopes=["read", "write"],
+            idp_tokens={
+                "access_token": "upstream-access",
+                "refresh_token": "upstream-refresh",
+                "expires_in": 3600,
+                "refresh_expires_in": one_year,
+                "token_type": "Bearer",
+            },
+            expires_at=time.time() + 300,
+            created_at=time.time(),
+        )
+        await proxy._code_store.put(key=client_code.code, value=client_code)
+
+        result = await proxy.exchange_authorization_code(
+            client=client,
+            authorization_code=AuthorizationCode(
+                code="long-refresh-code",
+                scopes=["read", "write"],
+                expires_at=time.time() + 300,
+                client_id="test-client",
+                code_challenge="test-challenge",
+                redirect_uri=AnyUrl("http://localhost:12345/callback"),
+                redirect_uri_provided_explicitly=True,
+            ),
+        )
+        assert result.refresh_token is not None
+
+        # The refresh JWT exp claim should reflect the 1-year upstream lifetime
+        refresh_payload = proxy.jwt_issuer.verify_token(
+            result.refresh_token, expected_token_use="refresh"
+        )
+        # exp - iat should be approximately one_year (allow small clock skew)
+        assert refresh_payload["exp"] - refresh_payload["iat"] == pytest.approx(
+            one_year, abs=5
+        )
+
+    async def test_initial_exchange_uses_fallback_when_upstream_silent(
+        self, jwt_verifier
+    ):
+        """When upstream omits refresh_expires_in, fall back to configured value.
+
+        Default is 1 year (was previously 30 days, ignoring user config).
+        """
+        custom_fallback = 60 * 60 * 24 * 90  # 90 days
+        proxy = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=jwt_verifier,
+            base_url="https://proxy.example.com",
+            jwt_signing_key="test-secret-key",
+            fallback_refresh_token_expiry_seconds=custom_fallback,
+            client_storage=MemoryStore(),
+        )
+        proxy.set_mcp_path("/mcp")
+
+        client = OAuthClientInformationFull(
+            client_id="test-client",
+            client_secret="test-secret",
+            redirect_uris=[AnyUrl("http://localhost:12345/callback")],
+        )
+        await proxy.register_client(client)
+
+        client_code = ClientCode(
+            code="silent-refresh-code",
+            client_id="test-client",
+            redirect_uri="http://localhost:12345/callback",
+            code_challenge="test-challenge",
+            code_challenge_method="S256",
+            scopes=["read", "write"],
+            idp_tokens={
+                "access_token": "upstream-access",
+                "refresh_token": "upstream-refresh",
+                "expires_in": 3600,
+                # no refresh_expires_in — upstream is silent
+                "token_type": "Bearer",
+            },
+            expires_at=time.time() + 300,
+            created_at=time.time(),
+        )
+        await proxy._code_store.put(key=client_code.code, value=client_code)
+
+        result = await proxy.exchange_authorization_code(
+            client=client,
+            authorization_code=AuthorizationCode(
+                code="silent-refresh-code",
+                scopes=["read", "write"],
+                expires_at=time.time() + 300,
+                client_id="test-client",
+                code_challenge="test-challenge",
+                redirect_uri=AnyUrl("http://localhost:12345/callback"),
+                redirect_uri_provided_explicitly=True,
+            ),
+        )
+        assert result.refresh_token is not None
+
+        refresh_payload = proxy.jwt_issuer.verify_token(
+            result.refresh_token, expected_token_use="refresh"
+        )
+        assert refresh_payload["exp"] - refresh_payload["iat"] == pytest.approx(
+            custom_fallback, abs=5
+        )
+
+    async def test_refresh_jwt_exp_aligned_when_upstream_omits_refresh_token(
+        self, jwt_verifier
+    ):
+        """Bug 2: JWT exp must align with storage TTL when upstream omits refresh_token.
+
+        Cognito does NOT return a refresh_token on refresh. Previously the new
+        FastMCP refresh JWT was issued with hardcoded 30-day exp, while the
+        storage TTL correctly used the existing upstream refresh lifetime —
+        forcing re-login at day 30 even when the upstream refresh was valid
+        for much longer.
+        """
+        proxy = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=jwt_verifier,
+            base_url="https://proxy.example.com",
+            jwt_signing_key="test-secret-key",
+            client_storage=MemoryStore(),
+        )
+        proxy.set_mcp_path("/mcp")
+
+        client = OAuthClientInformationFull(
+            client_id="test-client",
+            client_secret="test-secret",
+            redirect_uris=[AnyUrl("http://localhost:12345/callback")],
+        )
+        await proxy.register_client(client)
+
+        # Seed an upstream session whose refresh token has 6 months left
+        now = time.time()
+        upstream_refresh_expires_at = now + (60 * 60 * 24 * 180)
+        upstream_token_id = "upstream-id-cognito"
+        upstream_token_set = UpstreamTokenSet(
+            upstream_token_id=upstream_token_id,
+            access_token="upstream-access-old",
+            refresh_token="upstream-refresh-tok",
+            refresh_token_expires_at=upstream_refresh_expires_at,
+            expires_at=now + 60,  # access nearly expired (irrelevant here)
+            token_type="Bearer",
+            scope="read write",
+            client_id="test-client",
+            created_at=now,
+            raw_token_data={},
+        )
+        await proxy._upstream_token_store.put(
+            key=upstream_token_id,
+            value=upstream_token_set,
+            ttl=int(upstream_refresh_expires_at - now),
+        )
+
+        # Issue a FastMCP refresh JWT pointing at this session
+        old_refresh_jti = "old-refresh-jti"
+        old_refresh_jwt = proxy.jwt_issuer.issue_refresh_token(
+            client_id="test-client",
+            scopes=["read", "write"],
+            jti=old_refresh_jti,
+            expires_in=int(upstream_refresh_expires_at - now),
+        )
+        await proxy._jti_mapping_store.put(
+            key=old_refresh_jti,
+            value=JTIMapping(
+                jti=old_refresh_jti,
+                upstream_token_id=upstream_token_id,
+                created_at=now,
+            ),
+            ttl=int(upstream_refresh_expires_at - now),
+        )
+        await proxy._refresh_token_store.put(
+            key=_hash_token(old_refresh_jwt),
+            value=RefreshTokenMetadata(
+                client_id="test-client",
+                scopes=["read", "write"],
+                expires_at=int(upstream_refresh_expires_at),
+                created_at=now,
+            ),
+            ttl=int(upstream_refresh_expires_at - now),
+        )
+
+        # Mock the upstream refresh response — Cognito-style: NO refresh_token
+        async def fake_refresh(url, refresh_token, scope=None, **kwargs):
+            return {
+                "access_token": "upstream-access-new",
+                "expires_in": 3600,
+                "token_type": "Bearer",
+                # NO refresh_token, NO refresh_expires_in
+            }
+
+        oauth_client_mock = Mock()
+        oauth_client_mock.refresh_token = AsyncMock(side_effect=fake_refresh)
+        oauth_client_mock.aclose = AsyncMock()
+        with patch.object(
+            proxy,
+            "_create_upstream_oauth_client",
+            return_value=oauth_client_mock,
+        ):
+            new_token = await proxy.exchange_refresh_token(
+                client=client,
+                refresh_token=RefreshToken(
+                    token=old_refresh_jwt,
+                    client_id="test-client",
+                    scopes=["read", "write"],
+                    expires_at=int(upstream_refresh_expires_at),
+                ),
+                scopes=["read", "write"],
+            )
+
+        assert new_token.refresh_token is not None
+        # New refresh JWT exp must reflect remaining upstream refresh lifetime
+        # (~6 months), not a hardcoded 30 days
+        new_refresh_payload = proxy.jwt_issuer.verify_token(
+            new_token.refresh_token, expected_token_use="refresh"
+        )
+        ttl_remaining = new_refresh_payload["exp"] - new_refresh_payload["iat"]
+        # Should be close to 180 days, well above the old 30-day cliff
+        assert ttl_remaining > 60 * 60 * 24 * 90  # at least 90 days
+
+
+class TestFastMCPAccessTokenExpiry:
+    """Tests for fastmcp_access_token_expiry_seconds (issue #4252).
+
+    The FastMCP-issued access token is a reference into FastMCP storage; its
+    lifetime can be decoupled from the upstream provider's short `expires_in`
+    so MCP clients that don't refresh gracefully (e.g. mcp-remote) aren't forced
+    through a full re-auth on every idle period. The upstream token's real expiry
+    is preserved internally to drive transparent refresh.
+    """
+
+    @pytest.fixture
+    def jwt_verifier(self):
+        verifier = Mock(spec=TokenVerifier)
+        verifier.required_scopes = ["read", "write"]
+        verifier.verify_token = AsyncMock(return_value=None)
+        return verifier
+
+    def _make_proxy(self, jwt_verifier, **kwargs):
+        return OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=jwt_verifier,
+            base_url="https://proxy.example.com",
+            jwt_signing_key="test-secret-key",
+            client_storage=MemoryStore(),
+            **kwargs,
+        )
+
+    def test_parameter_stored(self, jwt_verifier):
+        proxy = self._make_proxy(
+            jwt_verifier, fastmcp_access_token_expiry_seconds=86400
+        )
+        assert proxy._fastmcp_access_token_expiry_seconds == 86400
+
+    def test_parameter_defaults_to_none(self, jwt_verifier):
+        proxy = self._make_proxy(jwt_verifier)
+        assert proxy._fastmcp_access_token_expiry_seconds is None
+
+    async def _exchange(self, proxy, code="test-code", **idp_token_overrides):
+        proxy.set_mcp_path("/mcp")
+        client = OAuthClientInformationFull(
+            client_id="test-client",
+            client_secret="test-secret",
+            redirect_uris=[AnyUrl("http://localhost:12345/callback")],
+        )
+        await proxy.register_client(client)
+
+        idp_tokens = {
+            "access_token": "upstream-access",
+            "refresh_token": "upstream-refresh",
+            "expires_in": 3600,
+            "token_type": "Bearer",
+            **idp_token_overrides,
+        }
+        # Allow callers to drop a default key by overriding it with None
+        # (e.g. refresh_token=None to simulate a provider that issues none).
+        idp_tokens = {k: v for k, v in idp_tokens.items() if v is not None}
+        client_code = ClientCode(
+            code=code,
+            client_id="test-client",
+            redirect_uri="http://localhost:12345/callback",
+            code_challenge="test-challenge",
+            code_challenge_method="S256",
+            scopes=["read", "write"],
+            idp_tokens=idp_tokens,
+            expires_at=time.time() + 300,
+            created_at=time.time(),
+        )
+        await proxy._code_store.put(key=client_code.code, value=client_code)
+
+        return client, await proxy.exchange_authorization_code(
+            client=client,
+            authorization_code=AuthorizationCode(
+                code=code,
+                scopes=["read", "write"],
+                expires_at=time.time() + 300,
+                client_id="test-client",
+                code_challenge="test-challenge",
+                redirect_uri=AnyUrl("http://localhost:12345/callback"),
+                redirect_uri_provided_explicitly=True,
+            ),
+        )
+
+    async def test_initial_exchange_decouples_access_token_from_upstream(
+        self, jwt_verifier
+    ):
+        """A long FastMCP TTL applies even though upstream returns expires_in=3600."""
+        one_day = 60 * 60 * 24
+        proxy = self._make_proxy(
+            jwt_verifier, fastmcp_access_token_expiry_seconds=one_day
+        )
+
+        _, result = await self._exchange(proxy)
+
+        # Response and JWT exp reflect the configured FastMCP lifetime, not 3600
+        assert result.expires_in == one_day
+        access_payload = proxy.jwt_issuer.verify_token(result.access_token)
+        assert access_payload["exp"] - access_payload["iat"] == pytest.approx(
+            one_day, abs=5
+        )
+
+    async def test_upstream_token_expiry_preserved_for_transparent_refresh(
+        self, jwt_verifier
+    ):
+        """Decoupling must not corrupt the upstream token's real expiry.
+
+        The stored upstream token still expires at ~upstream expires_in so that
+        transparent refresh fires; only the FastMCP-issued token lives longer.
+        """
+        one_day = 60 * 60 * 24
+        proxy = self._make_proxy(
+            jwt_verifier, fastmcp_access_token_expiry_seconds=one_day
+        )
+
+        _, result = await self._exchange(proxy)
+
+        access_jti = proxy.jwt_issuer.verify_token(result.access_token)["jti"]
+        jti_mapping = await proxy._jti_mapping_store.get(key=access_jti)
+        assert jti_mapping is not None
+        stored = await proxy._upstream_token_store.get(
+            key=jti_mapping.upstream_token_id
+        )
+        assert stored is not None
+        # Upstream access token expiry tracks the upstream lifetime (~3600s),
+        # NOT the 1-day FastMCP token lifetime.
+        assert stored.expires_at - time.time() == pytest.approx(3600, abs=30)
+
+    async def test_access_jti_mapping_ttl_matches_configured_lifetime(
+        self, jwt_verifier
+    ):
+        """The access JTI mapping must outlive the upstream access token.
+
+        The JWT exp and the JTI mapping TTL are set from the same value, so a
+        drift between them would let the JWT verify while its storage lookup has
+        already expired — silently breaking long-idle sessions. Guard the TTL
+        passed to storage directly, since wall-clock expiry can't be exercised
+        in a fast unit test.
+        """
+        one_week = 60 * 60 * 24 * 7
+        proxy = self._make_proxy(
+            jwt_verifier, fastmcp_access_token_expiry_seconds=one_week
+        )
+
+        original_put = proxy._jti_mapping_store.put
+        calls: list[dict] = []
+
+        async def spy(**kwargs):
+            calls.append(kwargs)
+            return await original_put(**kwargs)
+
+        with patch.object(proxy._jti_mapping_store, "put", side_effect=spy):
+            _, result = await self._exchange(proxy)
+
+        access_jti = proxy.jwt_issuer.verify_token(result.access_token)["jti"]
+        access_call = next(c for c in calls if c["value"].jti == access_jti)
+        assert access_call["ttl"] == one_week
+
+    @pytest.mark.parametrize(
+        "configured, expected",
+        [
+            (60 * 60 * 24 * 7, 3600),  # configured > upstream -> capped at upstream
+            (600, 600),  # configured < upstream -> honored (still <= upstream)
+        ],
+    )
+    async def test_no_refresh_token_does_not_extend_past_upstream(
+        self, jwt_verifier, configured, expected
+    ):
+        """Without an upstream refresh token, the FastMCP token can't be renewed.
+
+        Issuing a token that claims to outlive the upstream access token would be
+        a lie — there's no way to transparently refresh it — so the lifetime is
+        capped at the upstream `expires_in` when no refresh token is present.
+        """
+        proxy = self._make_proxy(
+            jwt_verifier, fastmcp_access_token_expiry_seconds=configured
+        )
+
+        _, result = await self._exchange(proxy, refresh_token=None)
+
+        assert result.expires_in == expected
+        access_payload = proxy.jwt_issuer.verify_token(result.access_token)
+        assert access_payload["exp"] - access_payload["iat"] == pytest.approx(
+            expected, abs=5
+        )
+
+    async def test_extended_token_survives_upstream_expiry_via_refresh(self):
+        """End-to-end: a long-lived FastMCP token keeps working after the upstream
+        access token expires, by transparently refreshing underneath.
+
+        Proves the pieces integrate: the long-exp JWT still verifies, its JTI
+        mapping still resolves, and an expired upstream token triggers transparent
+        refresh rather than a 401.
+        """
+        one_week = 60 * 60 * 24 * 7
+
+        verifier = Mock(spec=TokenVerifier)
+        verifier.required_scopes = ["read", "write"]
+
+        async def verify(token: str) -> AccessToken | None:
+            if token.startswith("refreshed-"):
+                return AccessToken(
+                    token=token,
+                    client_id="test-client",
+                    scopes=["read", "write"],
+                    expires_at=int(time.time() + 3600),
+                )
+            return None  # original upstream token is treated as invalid/expired
+
+        verifier.verify_token = AsyncMock(side_effect=verify)
+        proxy = self._make_proxy(verifier, fastmcp_access_token_expiry_seconds=one_week)
+
+        _, result = await self._exchange(proxy)
+
+        # Force the stored upstream access token to be expired.
+        access_jti = proxy.jwt_issuer.verify_token(result.access_token)["jti"]
+        jti_mapping = await proxy._jti_mapping_store.get(key=access_jti)
+        assert jti_mapping is not None
+        stored = await proxy._upstream_token_store.get(
+            key=jti_mapping.upstream_token_id
+        )
+        assert stored is not None
+        stored.expires_at = time.time() - 60
+        await proxy._upstream_token_store.put(
+            key=jti_mapping.upstream_token_id, value=stored, ttl=one_week
+        )
+
+        mock_oauth_client = AsyncMock()
+        mock_oauth_client.refresh_token = AsyncMock(
+            return_value={
+                "access_token": "refreshed-upstream-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "upstream-refresh",
+                "scope": "read write",
+            }
+        )
+
+        with patch.object(
+            proxy, "_create_upstream_oauth_client", return_value=mock_oauth_client
+        ):
+            loaded = await proxy.load_access_token(result.access_token)
+
+        assert loaded is not None
+        assert loaded.token == "refreshed-upstream-access"
+        mock_oauth_client.refresh_token.assert_called_once()
+
+    async def test_initial_exchange_default_mirrors_upstream(self, jwt_verifier):
+        """With the param unset, the FastMCP access token mirrors upstream."""
+        proxy = self._make_proxy(jwt_verifier)
+
+        _, result = await self._exchange(proxy)
+
+        assert result.expires_in == 3600
+        access_payload = proxy.jwt_issuer.verify_token(result.access_token)
+        assert access_payload["exp"] - access_payload["iat"] == pytest.approx(
+            3600, abs=5
+        )
+
+    async def test_refresh_exchange_decouples_access_token(self, jwt_verifier):
+        """Re-issued access tokens on refresh also honor the configured lifetime."""
+        one_day = 60 * 60 * 24
+        proxy = self._make_proxy(
+            jwt_verifier, fastmcp_access_token_expiry_seconds=one_day
+        )
+
+        client, result = await self._exchange(proxy)
+        assert result.refresh_token is not None
+
+        mock_oauth_client = AsyncMock()
+        mock_oauth_client.refresh_token = AsyncMock(
+            return_value={
+                "access_token": "refreshed-upstream-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "upstream-refresh",
+                "scope": "read write",
+            }
+        )
+
+        with patch.object(
+            proxy, "_create_upstream_oauth_client", return_value=mock_oauth_client
+        ):
+            refreshed = await proxy.exchange_refresh_token(
+                client=client,
+                refresh_token=RefreshToken(
+                    token=result.refresh_token,
+                    client_id="test-client",
+                    scopes=["read", "write"],
+                ),
+                scopes=["read", "write"],
+            )
+
+        assert refreshed.expires_in == one_day
+        access_payload = proxy.jwt_issuer.verify_token(refreshed.access_token)
+        assert access_payload["exp"] - access_payload["iat"] == pytest.approx(
+            one_day, abs=5
+        )
 
 
 class TestUpstreamTokenStorageTTL:
@@ -515,7 +1178,7 @@ class TestUpstreamTokenStorageTTL:
         assert upstream_tokens is not None
 
     async def test_refresh_expires_in_zero_issues_refresh_token(self, proxy):
-        """refresh_expires_in=0 should fall back to 30-day default.
+        """refresh_expires_in=0 should fall back to the configured default.
 
         Keycloak returns refresh_expires_in=0 for offline tokens (offline_access scope),
         meaning "no fixed time-based expiry". The proxy should still issue a PROXY_RT.
@@ -734,6 +1397,7 @@ class TestTransparentUpstreamRefresh:
         assert result is not None
         assert result.token == "refreshed-upstream-access"
         mock_oauth_client.refresh_token.assert_called_once()
+        mock_oauth_client.aclose.assert_awaited_once()
 
     async def test_transparent_refresh_updates_stored_token(self, proxy):
         """After transparent refresh, the stored upstream token is updated."""
@@ -907,6 +1571,38 @@ class TestTransparentUpstreamRefresh:
         assert result is not None
         assert result.token == "refreshed-upstream-access"
 
+    def test_refresh_lock_cache_bounded(self, proxy, monkeypatch):
+        """_get_refresh_lock never grows beyond _REFRESH_LOCK_CACHE_SIZE."""
+        monkeypatch.setattr(
+            "fastmcp.server.auth.oauth_proxy.proxy._REFRESH_LOCK_CACHE_SIZE", 3
+        )
+        for i in range(10):
+            proxy._get_refresh_lock(f"token-{i}")
+        assert len(proxy._refresh_locks) == 3
+
+    def test_refresh_lock_lru_evicts_least_recently_used(self, proxy, monkeypatch):
+        """Touching an entry promotes it; eviction removes the oldest untouched entry."""
+        monkeypatch.setattr(
+            "fastmcp.server.auth.oauth_proxy.proxy._REFRESH_LOCK_CACHE_SIZE", 3
+        )
+        proxy._get_refresh_lock("a")
+        proxy._get_refresh_lock("b")
+        proxy._get_refresh_lock("c")
+        # Touch "a" to move it to MRU position
+        proxy._get_refresh_lock("a")
+        # Adding "d" should evict "b" (oldest untouched)
+        proxy._get_refresh_lock("d")
+        assert "b" not in proxy._refresh_locks
+        assert "a" in proxy._refresh_locks
+        assert "c" in proxy._refresh_locks
+        assert "d" in proxy._refresh_locks
+
+    def test_refresh_lock_same_token_returns_same_lock(self, proxy):
+        """Requesting the same token ID twice returns the same lock object."""
+        lock1 = proxy._get_refresh_lock("tok")
+        lock2 = proxy._get_refresh_lock("tok")
+        assert lock1 is lock2
+
     async def test_upstream_claims_propagated(self, proxy):
         jwt = await self._setup_session_with_claims(
             proxy, upstream_claims={"sub": "user-123"}
@@ -929,3 +1625,289 @@ class TestTransparentUpstreamRefresh:
             returned = await mock_verifier.verify_token(call.args[0])
             if returned:
                 assert "upstream_claims" not in returned.claims
+
+    async def test_transparent_refresh_triggered_by_threshold(self, mock_verifier):
+        """Token within expiry threshold is treated as expired and refreshed."""
+        proxy = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=mock_verifier,
+            base_url="https://proxy.example.com",
+            jwt_signing_key="test-secret-key",
+            client_storage=MemoryStore(),
+            token_expiry_threshold_seconds=60,
+        )
+        proxy.set_mcp_path("/mcp")
+
+        upstream_token_id = "upstream-tok-threshold"
+        access_jti = "test-threshold-jti"
+
+        upstream_token_set = UpstreamTokenSet(
+            upstream_token_id=upstream_token_id,
+            access_token="almost-expired-upstream-access",
+            refresh_token="upstream-refresh-tok",
+            refresh_token_expires_at=time.time() + 86400,
+            expires_at=time.time() + 30,  # expires in 30s, within 60s threshold
+            token_type="Bearer",
+            scope="read",
+            client_id="test-client",
+            created_at=time.time() - 3600,
+        )
+        await proxy._upstream_token_store.put(
+            key=upstream_token_id,
+            value=upstream_token_set,
+            ttl=86400,
+        )
+        await proxy._jti_mapping_store.put(
+            key=access_jti,
+            value=JTIMapping(
+                jti=access_jti,
+                upstream_token_id=upstream_token_id,
+                created_at=time.time(),
+            ),
+            ttl=3600,
+        )
+        fastmcp_jwt = proxy.jwt_issuer.issue_access_token(
+            client_id="test-client",
+            scopes=["read"],
+            jti=access_jti,
+            expires_in=3600,
+        )
+
+        mock_oauth_client = AsyncMock()
+        mock_oauth_client.refresh_token = AsyncMock(
+            return_value={
+                "access_token": "refreshed-upstream-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "upstream-refresh-tok",
+                "scope": "read",
+            }
+        )
+
+        with patch.object(
+            proxy, "_create_upstream_oauth_client", return_value=mock_oauth_client
+        ):
+            result = await proxy.load_access_token(fastmcp_jwt)
+
+        assert result is not None
+        assert result.token == "refreshed-upstream-access"
+        mock_oauth_client.refresh_token.assert_called_once()
+
+    async def test_no_refresh_when_within_threshold_but_no_refresh_token(
+        self, mock_verifier
+    ):
+        """Token within threshold but without refresh token is not refreshed."""
+        proxy = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=mock_verifier,
+            base_url="https://proxy.example.com",
+            jwt_signing_key="test-secret-key",
+            client_storage=MemoryStore(),
+            token_expiry_threshold_seconds=60,
+        )
+        proxy.set_mcp_path("/mcp")
+
+        upstream_token_id = "upstream-tok-no-refresh"
+        access_jti = "test-no-refresh-jti"
+
+        upstream_token_set = UpstreamTokenSet(
+            upstream_token_id=upstream_token_id,
+            access_token="valid-upstream-access",
+            refresh_token=None,
+            refresh_token_expires_at=None,
+            expires_at=time.time() + 30,  # expires in 30s, within 60s threshold
+            token_type="Bearer",
+            scope="read",
+            client_id="test-client",
+            created_at=time.time() - 3600,
+        )
+        await proxy._upstream_token_store.put(
+            key=upstream_token_id,
+            value=upstream_token_set,
+            ttl=86400,
+        )
+        await proxy._jti_mapping_store.put(
+            key=access_jti,
+            value=JTIMapping(
+                jti=access_jti,
+                upstream_token_id=upstream_token_id,
+                created_at=time.time(),
+            ),
+            ttl=3600,
+        )
+        fastmcp_jwt = proxy.jwt_issuer.issue_access_token(
+            client_id="test-client",
+            scopes=["read"],
+            jti=access_jti,
+            expires_in=3600,
+        )
+
+        result = await proxy.load_access_token(fastmcp_jwt)
+
+        # Token validates via the verifier (starts with "valid-"), so even though
+        # it's within threshold, no refresh is attempted without a refresh token.
+        assert result is not None
+        assert result.token == "valid-upstream-access"
+
+    async def test_zero_threshold_only_refreshes_on_actual_expiry(self, mock_verifier):
+        """With threshold=0, token that's not yet expired is not refreshed."""
+        proxy = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=mock_verifier,
+            base_url="https://proxy.example.com",
+            jwt_signing_key="test-secret-key",
+            client_storage=MemoryStore(),
+            token_expiry_threshold_seconds=0,
+        )
+        proxy.set_mcp_path("/mcp")
+
+        upstream_token_id = "upstream-tok-zero-threshold"
+        access_jti = "test-zero-threshold-jti"
+
+        upstream_token_set = UpstreamTokenSet(
+            upstream_token_id=upstream_token_id,
+            access_token="valid-upstream-access",
+            refresh_token="upstream-refresh-tok",
+            refresh_token_expires_at=time.time() + 86400,
+            expires_at=time.time() + 30,  # expires in 30s, but threshold is 0
+            token_type="Bearer",
+            scope="read",
+            client_id="test-client",
+            created_at=time.time() - 3600,
+        )
+        await proxy._upstream_token_store.put(
+            key=upstream_token_id,
+            value=upstream_token_set,
+            ttl=86400,
+        )
+        await proxy._jti_mapping_store.put(
+            key=access_jti,
+            value=JTIMapping(
+                jti=access_jti,
+                upstream_token_id=upstream_token_id,
+                created_at=time.time(),
+            ),
+            ttl=3600,
+        )
+        fastmcp_jwt = proxy.jwt_issuer.issue_access_token(
+            client_id="test-client",
+            scopes=["read"],
+            jti=access_jti,
+            expires_in=3600,
+        )
+
+        result = await proxy.load_access_token(fastmcp_jwt)
+
+        # With threshold=0, token with 30s remaining is still valid
+        assert result is not None
+        assert result.token == "valid-upstream-access"
+
+    async def test_proactive_refresh_when_validated_but_within_threshold(
+        self, mock_verifier
+    ):
+        """Token that passes validation but is within threshold gets proactively refreshed."""
+        proxy = OAuthProxy(
+            upstream_authorization_endpoint="https://idp.example.com/authorize",
+            upstream_token_endpoint="https://idp.example.com/token",
+            upstream_client_id="test-client",
+            upstream_client_secret="test-secret",
+            token_verifier=mock_verifier,
+            base_url="https://proxy.example.com",
+            jwt_signing_key="test-secret-key",
+            client_storage=MemoryStore(),
+            token_expiry_threshold_seconds=60,
+        )
+        proxy.set_mcp_path("/mcp")
+
+        upstream_token_id = "upstream-tok-proactive"
+        access_jti = "test-proactive-jti"
+
+        # Token starts with "valid-" so the mock verifier accepts it,
+        # but it expires in 30s which is within the 60s threshold.
+        upstream_token_set = UpstreamTokenSet(
+            upstream_token_id=upstream_token_id,
+            access_token="valid-but-near-expiry",
+            refresh_token="upstream-refresh-tok",
+            refresh_token_expires_at=time.time() + 86400,
+            expires_at=time.time() + 30,
+            token_type="Bearer",
+            scope="read",
+            client_id="test-client",
+            created_at=time.time() - 3600,
+        )
+        await proxy._upstream_token_store.put(
+            key=upstream_token_id,
+            value=upstream_token_set,
+            ttl=86400,
+        )
+        await proxy._jti_mapping_store.put(
+            key=access_jti,
+            value=JTIMapping(
+                jti=access_jti,
+                upstream_token_id=upstream_token_id,
+                created_at=time.time(),
+            ),
+            ttl=3600,
+        )
+        fastmcp_jwt = proxy.jwt_issuer.issue_access_token(
+            client_id="test-client",
+            scopes=["read"],
+            jti=access_jti,
+            expires_in=3600,
+        )
+
+        mock_oauth_client = AsyncMock()
+        mock_oauth_client.refresh_token = AsyncMock(
+            return_value={
+                "access_token": "refreshed-upstream-access",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+                "refresh_token": "upstream-refresh-tok",
+                "scope": "read",
+            }
+        )
+
+        with patch.object(
+            proxy, "_create_upstream_oauth_client", return_value=mock_oauth_client
+        ):
+            result = await proxy.load_access_token(fastmcp_jwt)
+
+        assert result is not None
+        assert result.token == "refreshed-upstream-access"
+        mock_oauth_client.refresh_token.assert_called_once()
+
+
+class TestRefreshTokenMissLogging:
+    """A refresh-token miss forces a user-visible reconnect, so it must not be silent."""
+
+    async def test_unknown_refresh_token_logs_warning(self, oauth_proxy, caplog):
+        client = OAuthClientInformationFull(
+            client_id="test-client",
+            client_secret="test-secret",
+            redirect_uris=[AnyUrl("http://localhost:12345/callback")],
+        )
+
+        proxy_logger = logging.getLogger("fastmcp.server.auth.oauth_proxy.proxy")
+        caplog.set_level(logging.WARNING)
+        proxy_logger.addHandler(caplog.handler)
+        try:
+            result = await oauth_proxy.load_refresh_token(client, "nonexistent-token")
+        finally:
+            proxy_logger.removeHandler(caplog.handler)
+
+        assert result is None
+        assert any(
+            record.levelno == logging.WARNING
+            and "Refresh token not found" in record.getMessage()
+            and "test-client" in record.getMessage()
+            for record in caplog.records
+        )

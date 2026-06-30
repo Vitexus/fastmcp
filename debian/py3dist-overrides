@@ -10,3 +10,6 @@ uncalled_for python3-uncalled-for
 griffelib python3-griffelib
 watchfiles python3-watchfiles
 pyyaml python3-yaml
+joserfc python3-joserfc
+python_multipart python3-python-multipart
+pydantic_settings python3-pydantic-settings

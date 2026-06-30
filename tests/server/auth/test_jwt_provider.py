@@ -1,8 +1,13 @@
+import time
 from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import patch
 
 import pytest
+from joserfc import jwk as jose_jwk
+from joserfc import jwt
+from joserfc.jws import JWSRegistry
+from joserfc.registry import HeaderParameter
 from pytest_httpx import HTTPXMock
 
 from fastmcp import FastMCP
@@ -42,10 +47,6 @@ class SymmetricKeyHelper:
             additional_claims: Any additional claims to include
             algorithm: JWT signing algorithm (HS256, HS384, or HS512)
         """
-        import time
-
-        from authlib.jose import JsonWebToken
-
         # Create header
         header = {"alg": algorithm}
 
@@ -67,10 +68,10 @@ class SymmetricKeyHelper:
             payload.update(additional_claims)
 
         # Create JWT
-        jwt_lib = JsonWebToken([algorithm])
-        token_bytes = jwt_lib.encode(header, payload, self.secret)
+        signing_key = jose_jwk.import_key(self.secret, "oct")
+        token = jwt.encode(header, payload, signing_key, algorithms=[algorithm])
 
-        return token_bytes.decode("utf-8")
+        return token
 
 
 @pytest.fixture(scope="module")
@@ -181,6 +182,73 @@ class TestRSAKeyPair:
 
         assert isinstance(token, str)
         # We'll validate the scopes in the BearerToken tests
+
+
+class TestJWTVerifierHeaders:
+    async def test_non_critical_private_header_is_allowed(
+        self, rsa_key_pair: RSAKeyPair
+    ):
+        signing_key = jose_jwk.import_key(
+            rsa_key_pair.private_key.get_secret_value(),
+            "RSA",
+        )
+        token = jwt.encode(
+            {
+                "alg": "RS256",
+                "cat": "cl_example",
+            },
+            {
+                "sub": "test-user",
+                "iss": "https://test.example.com",
+                "exp": int(time.time()) + 3600,
+            },
+            signing_key,
+            algorithms=["RS256"],
+            registry=JWSRegistry(strict_check_header=False),
+        )
+        verifier = JWTVerifier(
+            public_key=rsa_key_pair.public_key,
+            issuer="https://test.example.com",
+        )
+
+        access_token = await verifier.verify_token(token)
+
+        assert access_token is not None
+        assert access_token.client_id == "test-user"
+
+    async def test_critical_private_header_is_rejected(self, rsa_key_pair: RSAKeyPair):
+        signing_key = jose_jwk.import_key(
+            rsa_key_pair.private_key.get_secret_value(),
+            "RSA",
+        )
+        token = jwt.encode(
+            {
+                "alg": "RS256",
+                "crit": ["cat"],
+                "cat": "cl_example",
+            },
+            {
+                "sub": "test-user",
+                "iss": "https://test.example.com",
+                "exp": int(time.time()) + 3600,
+            },
+            signing_key,
+            algorithms=["RS256"],
+            registry=JWSRegistry(
+                header_registry={
+                    "cat": HeaderParameter("Custom private header", "str")
+                },
+                strict_check_header=False,
+            ),
+        )
+        verifier = JWTVerifier(
+            public_key=rsa_key_pair.public_key,
+            issuer="https://test.example.com",
+        )
+
+        access_token = await verifier.verify_token(token)
+
+        assert access_token is None
 
 
 class TestSymmetricKeyJWT:
@@ -433,13 +501,22 @@ class TestBearerTokenJWKS:
     @pytest.fixture
     def mock_jwks_data(self, rsa_key_pair: RSAKeyPair) -> JWKSData:
         """Create mock JWKS data from RSA key pair."""
-        from authlib.jose import JsonWebKey
-
         # Create JWK from the RSA public key
-        jwk = JsonWebKey.import_key(rsa_key_pair.public_key)
-        jwk_data: JWKData = jwk.as_dict()
-        jwk_data["kid"] = "test-key-1"
-        jwk_data["alg"] = "RS256"
+        public_key = jose_jwk.import_key(rsa_key_pair.public_key, "RSA")
+        public_key_data = public_key.as_dict()
+        kty = public_key_data["kty"]
+        n = public_key_data["n"]
+        e = public_key_data["e"]
+        assert isinstance(kty, str)
+        assert isinstance(n, str)
+        assert isinstance(e, str)
+        jwk_data = JWKData(
+            kty=kty,
+            n=n,
+            e=e,
+            kid="test-key-1",
+            alg="RS256",
+        )
 
         return {"keys": [jwk_data]}
 
